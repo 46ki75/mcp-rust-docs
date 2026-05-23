@@ -54,12 +54,13 @@ pub enum DocsRsRepositoryError {
         source: std::io::Error,
     },
 
-    /// The decompressed payload couldn't be deserialized by
-    /// `rustdoc-types` — malformed JSON, missing required fields, or a
-    /// shape `rustdoc-types` doesn't model. A `format_version` skew
-    /// against `rustdoc_types::FORMAT_VERSION` is caught *after*
-    /// successful deserialization and surfaces through
-    /// [`Self::FormatVersionMismatch`], not this variant.
+    /// The decompressed payload couldn't be deserialized by the
+    /// dispatched `rustdoc-types` crate — malformed JSON, missing
+    /// required fields, or a shape that version doesn't model. A
+    /// `format_version` skew against the set of supported versions is
+    /// caught *before* the full deserialize attempt by the dispatch
+    /// path and surfaces through [`Self::FormatVersionUnsupported`],
+    /// not this variant.
     #[error("failed to parse rustdoc JSON from {url}: {source}")]
     InvalidRustdocJson {
         /// URL whose payload failed to parse.
@@ -69,20 +70,27 @@ pub enum DocsRsRepositoryError {
         source: serde_json::Error,
     },
 
-    /// The payload parsed, but its `format_version` doesn't match the
-    /// version `rustdoc-types` was built against. Broken out from
+    /// The payload's `format_version` isn't one this build of
+    /// `mcp-rust-docs` ships a deserializer for. Broken out from
     /// [`Self::InvalidRustdocJson`] because the model needs to know
     /// this is an upstream-vs-tooling skew, not a corrupt response.
+    ///
+    /// The repository ships dispatch arms for each format version it
+    /// supports (currently 56 and 57 via the cargo-renamed
+    /// `rustdoc-types-56` / `rustdoc-types`); anything outside that set
+    /// surfaces here so the user can decide whether to upgrade the
+    /// tool or wait for docs.rs to rebuild.
     #[error(
         "rustdoc JSON from {url} has format_version {actual}, but this build of mcp-rust-docs \
-         understands format_version {expected}"
+         only supports {supported:?}"
     )]
-    FormatVersionMismatch {
+    FormatVersionUnsupported {
         /// URL the JSON was fetched from.
         url: String,
         /// `format_version` reported by the payload.
         actual: u32,
-        /// `format_version` this build of `rustdoc-types` was generated for.
-        expected: u32,
+        /// Format versions this build can deserialize, in dispatch
+        /// preference order.
+        supported: Vec<u32>,
     },
 }

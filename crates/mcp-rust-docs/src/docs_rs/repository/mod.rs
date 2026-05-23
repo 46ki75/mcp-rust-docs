@@ -16,6 +16,16 @@ pub use self::input::{FetchCrateDocsRepositoryInput, FetchRustdocJsonRepositoryI
 pub use self::output::{FetchCrateDocsRepositoryOutput, FetchRustdocJsonRepositoryOutput};
 
 use crate::crates_io::repository::BoxFuture;
+use crate::docs_rs::schema::DocsRsCrate;
+
+/// Format versions this build knows how to deserialize, in dispatch
+/// preference order (highest first). Each entry corresponds to a
+/// cargo-renamed `rustdoc-types*` dep and a matching arm in
+/// [`parse_dispatch`].
+pub(crate) const SUPPORTED_FORMAT_VERSIONS: &[u32] = &[
+    rustdoc_types::FORMAT_VERSION,
+    rustdoc_types_56::FORMAT_VERSION,
+];
 
 /// Convenience alias for the HTML-fetch result shape.
 pub type FetchCrateDocsResult = Result<FetchCrateDocsRepositoryOutput, DocsRsRepositoryError>;
@@ -46,11 +56,16 @@ pub trait DocsRsRepository: Send + Sync + 'static {
     ) -> BoxFuture<'_, FetchCrateDocsResult>;
 
     /// Fetch the zstd-compressed rustdoc JSON for a crate from
-    /// `/crate/{name}/{version}/json.zst`, decompress it (bounded by
-    /// [`MAX_DECOMPRESSED_BYTES`]), and deserialize into
-    /// [`rustdoc_types::Crate`]. The decompressed-and-parsed crate
-    /// is wrapped in `Arc` so the use case can pass it around without
-    /// cloning a multi-MB structure.
+    /// `/crate/{name}/{version}/json/{format}.zst`, decompress it
+    /// (bounded by [`MAX_DECOMPRESSED_BYTES`]), and deserialize into
+    /// the normalized [`DocsRsCrate`][crate::docs_rs::schema::DocsRsCrate].
+    ///
+    /// The repository inspects the JSON's `format_version` and
+    /// dispatches to whichever `rustdoc-types` crate models that
+    /// schema; unknown versions produce
+    /// [`DocsRsRepositoryError::FormatVersionUnsupported`]. The
+    /// decompressed-and-parsed crate is wrapped in `Arc` so the use
+    /// case can pass it around without cloning a multi-MB structure.
     fn fetch_rustdoc_json(
         &self,
         input: FetchRustdocJsonRepositoryInput,
@@ -127,22 +142,10 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
             // Move the decoded URL into the closure to keep error
             // payloads accurate.
             let final_url_owned = final_url.clone();
-            let parsed: Result<Arc<rustdoc_types::Crate>, DocsRsRepositoryError> =
+            let parsed: Result<Arc<DocsRsCrate>, DocsRsRepositoryError> =
                 tokio::task::spawn_blocking(move || {
                     let decompressed = decompress_zstd_bounded(&compressed, &final_url_owned)?;
-                    let crate_json = serde_json::from_slice::<rustdoc_types::Crate>(&decompressed)
-                        .map_err(|source| DocsRsRepositoryError::InvalidRustdocJson {
-                            url: final_url_owned.clone(),
-                            source,
-                        })?;
-                    if crate_json.format_version != rustdoc_types::FORMAT_VERSION {
-                        return Err(DocsRsRepositoryError::FormatVersionMismatch {
-                            url: final_url_owned,
-                            actual: crate_json.format_version,
-                            expected: rustdoc_types::FORMAT_VERSION,
-                        });
-                    }
-                    Ok(Arc::new(crate_json))
+                    parse_dispatch(&decompressed, &final_url_owned).map(Arc::new)
                 })
                 .await
                 .map_err(|join_err| DocsRsRepositoryError::Decompression {
@@ -156,6 +159,53 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
                 crate_json,
             })
         })
+    }
+}
+
+/// Peek at the JSON's `format_version` and dispatch to the matching
+/// upstream deserializer, normalizing the result into [`DocsRsCrate`].
+///
+/// The probe-parse only reads the top-level `format_version` field —
+/// serde tokenizes the rest of the document but builds no allocations
+/// for the schema, so the cost is bounded. We pay it once so the full
+/// parse can run against the correct schema and produce actionable
+/// errors instead of cryptic mid-stream `missing field` failures when
+/// docs.rs serves a format we don't model.
+fn parse_dispatch(bytes: &[u8], url: &str) -> Result<DocsRsCrate, DocsRsRepositoryError> {
+    #[derive(serde::Deserialize)]
+    struct FormatVersionProbe {
+        format_version: u32,
+    }
+
+    let probe = serde_json::from_slice::<FormatVersionProbe>(bytes).map_err(|source| {
+        DocsRsRepositoryError::InvalidRustdocJson {
+            url: url.to_string(),
+            source,
+        }
+    })?;
+
+    match probe.format_version {
+        v if v == rustdoc_types::FORMAT_VERSION => {
+            serde_json::from_slice::<rustdoc_types::Crate>(bytes)
+                .map(DocsRsCrate::from)
+                .map_err(|source| DocsRsRepositoryError::InvalidRustdocJson {
+                    url: url.to_string(),
+                    source,
+                })
+        }
+        v if v == rustdoc_types_56::FORMAT_VERSION => {
+            serde_json::from_slice::<rustdoc_types_56::Crate>(bytes)
+                .map(DocsRsCrate::from)
+                .map_err(|source| DocsRsRepositoryError::InvalidRustdocJson {
+                    url: url.to_string(),
+                    source,
+                })
+        }
+        actual => Err(DocsRsRepositoryError::FormatVersionUnsupported {
+            url: url.to_string(),
+            actual,
+            supported: SUPPORTED_FORMAT_VERSIONS.to_vec(),
+        }),
     }
 }
 
@@ -228,6 +278,13 @@ impl DocsRsRepositoryStub {
     pub(crate) async fn last_seen_url(&self) -> Option<String> {
         self.seen.lock().await.last().cloned()
     }
+
+    /// Snapshot of every URL the stub has been asked to fetch, in the
+    /// order requests arrived. Useful for tests that need to assert
+    /// the fallback chain walked the expected versions.
+    pub(crate) async fn seen_urls(&self) -> Vec<String> {
+        self.seen.lock().await.clone()
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +319,80 @@ impl DocsRsRepository for DocsRsRepositoryStub {
                 .pop()
                 .unwrap_or_else(|| Err(DocsRsRepositoryError::NotFound { url: input.url }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    const ANYHOW_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/anyhow_rustdoc.json.zst");
+    const SERDE_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/serde_rustdoc.json.zst");
+
+    fn decompress(zst: &[u8]) -> Vec<u8> {
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(zst).expect("zstd header");
+        let mut out = Vec::with_capacity(4 * 1024 * 1024);
+        decoder.read_to_end(&mut out).expect("zstd body");
+        out
+    }
+
+    fn anyhow_bytes() -> &'static [u8] {
+        static CACHED: OnceLock<Vec<u8>> = OnceLock::new();
+        CACHED.get_or_init(|| decompress(ANYHOW_FIXTURE))
+    }
+
+    fn serde_bytes() -> &'static [u8] {
+        static CACHED: OnceLock<Vec<u8>> = OnceLock::new();
+        CACHED.get_or_init(|| decompress(SERDE_FIXTURE))
+    }
+
+    #[test]
+    fn parse_dispatch_routes_format_57_via_current_rustdoc_types() {
+        let out = parse_dispatch(anyhow_bytes(), "test://anyhow")
+            .expect("anyhow fixture is format 57; dispatch must succeed");
+        // Sanity: real anyhow has hundreds of indexed items. We're
+        // confirming the From conversion populated the normalized
+        // shape, not just that deserialization succeeded.
+        assert!(!out.index.is_empty(), "index empty after dispatch");
+        assert!(!out.paths.is_empty(), "paths empty after dispatch");
+    }
+
+    #[test]
+    fn parse_dispatch_routes_format_56_via_renamed_dep() {
+        let out = parse_dispatch(serde_bytes(), "test://serde")
+            .expect("serde fixture is format 56; dispatch must succeed via rustdoc-types-56");
+        assert!(!out.index.is_empty(), "index empty after dispatch");
+        assert!(!out.paths.is_empty(), "paths empty after dispatch");
+    }
+
+    #[test]
+    fn parse_dispatch_reports_unsupported_format() {
+        let payload = br#"{"format_version":9999,"junk":true}"#;
+        let err = parse_dispatch(payload, "test://made-up")
+            .expect_err("format 9999 isn't supported; must error");
+        match err {
+            DocsRsRepositoryError::FormatVersionUnsupported {
+                actual, supported, ..
+            } => {
+                assert_eq!(actual, 9999);
+                assert_eq!(supported, SUPPORTED_FORMAT_VERSIONS.to_vec());
+            }
+            other => panic!("expected FormatVersionUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dispatch_reports_invalid_when_probe_cant_read_format_version() {
+        // Truly malformed payload (no `format_version` field at all)
+        // surfaces through InvalidRustdocJson, distinguishing
+        // "schema we don't know" from "bytes aren't even rustdoc JSON".
+        let payload = br#"{"hello":"world"}"#;
+        let err = parse_dispatch(payload, "test://garbage")
+            .expect_err("payload without format_version must error");
+        assert!(
+            matches!(err, DocsRsRepositoryError::InvalidRustdocJson { .. }),
+            "expected InvalidRustdocJson, got {err:?}",
+        );
     }
 }

@@ -18,4 +18,21 @@ pub enum DocsRsUseCaseError {
     /// [`DocsRsRepositoryError`].
     #[error(transparent)]
     Repository(#[from] DocsRsRepositoryError),
+
+    /// docs.rs returned 404 for every format-version variant the
+    /// fallback chain tried. Surfaced separately from a single
+    /// [`DocsRsRepositoryError::NotFound`] so the model can distinguish
+    /// "this crate doesn't exist" (most likely a typo) from "this
+    /// crate exists but docs.rs hasn't built any rustdoc-JSON format
+    /// this tool understands" (a real upstream-vs-tooling gap, often
+    /// transient until docs.rs rebuilds).
+    #[error(
+        "docs.rs has no rustdoc JSON for {crate_name} at any supported format version ({tried:?})"
+    )]
+    FormatVersionUnavailable {
+        /// The crate name the use case was asked about.
+        crate_name: String,
+        /// Format versions the fallback chain attempted, in order.
+        tried: Vec<u32>,
+    },
 }

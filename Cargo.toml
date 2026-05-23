@@ -40,7 +40,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6"
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+# docs.rs serves rustdoc-JSON at multiple schema versions depending on
+# when each crate was last built. We support the two versions currently
+# in circulation by pulling both crates in via cargo's package-rename
+# feature, then dispatching at deserialize time on the JSON's
+# `format_version` field. Adding a new version: bump the primary pin,
+# add a `rustdoc-types-NN` rename for the previous version, add the
+# matching From impl and dispatch arm in `docs_rs/schema.rs`, and add
+# a format-NN fixture under `tests/fixtures/`.
 rustdoc-types = "0.57"
+rustdoc-types-56 = { package = "rustdoc-types", version = "=0.56.0" }
 moka = { version = "0.12", features = ["future"] }
 
 [workspace.lints.clippy]

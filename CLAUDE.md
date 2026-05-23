@@ -11,7 +11,11 @@ An MCP (Model Context Protocol) server written in Rust on top of the
 - `get_crate_docs` — docs.rs HTML → Markdown for one page.
 - `search_crate_symbols` — name-based symbol index from rustdoc `all.html`.
 - `search_crate_docs` — full-text search over doc comments via docs.rs's
-  zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json.zst`).
+  zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json/{format_version}.zst`).
+  Walks a fallback chain across supported `format_version`s so crates
+  whose docs.rs build lags the current rustdoc schema (e.g. `serde`)
+  still work; see the *Multi-version rustdoc-JSON dispatch* section
+  below.
 
 The crate ships as a single binary, `mcp-rust-docs`, with two transport
 subcommands:
@@ -100,37 +104,81 @@ a second tool module.
 
 ### docs.rs has two distinct endpoint families — don't confuse them
 
-| Tool                                     | URL shape                                                                                                            | Repository method    |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                      | `fetch_crate_docs`   |
-| `search_crate_docs`                      | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
+| Tool                                     | URL shape                                                                                                                          | Repository method    |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                                    | `fetch_crate_docs`   |
+| `search_crate_docs`                      | `{base}/crate/{crate}/{version}/json/{format_version}.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
 
 The leading `/crate/` segment and the absence of the lib-name path are
 the easy-to-miss differences. `build_url` (HTML) and
 `build_rustdoc_json_url` (JSON) are kept separate for exactly this
 reason — don't try to unify them.
 
-### `rustdoc-types` format_version pinning
+The `/json/{format_version}` segment is required, not optional —
+docs.rs's bare `/json` returns "whatever's latest" for the crate,
+which has no relationship to what *this* build of `rustdoc-types` can
+deserialize. Pinning the segment guarantees we either get bytes we
+can parse or a clean 404 (which the use case routes into the fallback
+chain below).
 
-The repository validates `crate_json.format_version` against
-`rustdoc_types::FORMAT_VERSION` after deserialization and returns a
-dedicated `FormatVersionMismatch` error variant on skew. **This is
-intentional — fail loudly, don't try to be tolerant.** When
-`rustdoc-types` bumps its format version in a way that doesn't match
-what docs.rs serves, callers need to know which side is stale.
+### Multi-version rustdoc-JSON dispatch
 
-When refreshing the test fixture
-(`crates/mcp-rust-docs/tests/fixtures/anyhow_rustdoc.json.zst`), pull
-the latest from `https://docs.rs/crate/anyhow/latest/json.zst` after
-bumping `rustdoc-types` — both the inline unit test (in
-`src/docs_rs/use_case/mod.rs`) and the integration test
-(`tests/search_crate_docs.rs`) share the same file via different relative
-paths, so the path itself must stay stable.
+docs.rs serves rustdoc-JSON at multiple schema versions depending on
+when each crate was last built. The ecosystem is **heterogeneous** at
+any given moment: popular/recent crates sit at the current
+`FORMAT_VERSION`, but lagging crates (notably `serde` as of early
+2026) stay one or more versions behind until rebuilt. There's no
+single version that works for all crates.
+
+To handle both ends without forking the upstream type definitions, we
+pull in **multiple `rustdoc-types` crates in parallel** via cargo's
+package-rename feature. Each version owns one entry in
+`SUPPORTED_FORMAT_VERSIONS` (`docs_rs/repository/mod.rs`) and one arm
+in `parse_dispatch`. After deserialization, each upstream `Crate` is
+translated into the normalized `DocsRsCrate` (`docs_rs/schema.rs`) so
+the use case never references a specific upstream version directly.
+
+The use case (`search_crate_docs`) then walks
+`SUPPORTED_FORMAT_VERSIONS` in order, requesting each format URL until
+one succeeds. `NotFound` triggers the next attempt; any other error
+short-circuits the chain because retrying at a different format
+wouldn't fix it. All-404 surfaces as `FormatVersionUnavailable` (use
+case error) — distinct from `NotFound` so the tool layer can tell the
+user "this crate exists but no compatible format build does."
+
+**Adding a new format version** (`58`, `55`, etc.):
+
+1. Add a renamed dep to workspace `Cargo.toml`:
+   `rustdoc-types-NN = { package = "rustdoc-types", version = "=0.NN.0" }`
+   and inherit into `crates/mcp-rust-docs/Cargo.toml`.
+2. Add `impl_from_upstream!(rustdoc_types_NN);` at the bottom of
+   `docs_rs/schema.rs`. If the new version added required fields the
+   macro can't paper over, you'll need a hand-written `From` impl
+   instead.
+3. Add `rustdoc_types_NN::FORMAT_VERSION` to `SUPPORTED_FORMAT_VERSIONS`
+   in dispatch preference order (highest first → newest) and a
+   matching arm in `parse_dispatch`.
+4. Add a format-NN fixture under `tests/fixtures/` (download via
+   `curl https://docs.rs/crate/{crate}/latest/json/NN.zst`).
+5. Add a `parse_dispatch_routes_format_NN_via_…` unit test in
+   `repository/mod.rs`.
+6. Update `tests/search_crate_docs.rs`: bump the wiremock `.expect(N)`
+   on `search_crate_docs_reports_404_as_not_found` to reflect the new
+   chain length.
+
+When refreshing the existing fixtures
+(`anyhow_rustdoc.json.zst` for format 57, `serde_rustdoc.json.zst`
+for format 56), pull from `https://docs.rs/crate/{crate}/latest/json/{NN}.zst`
+— both the inline unit tests (in `src/docs_rs/repository/mod.rs` and
+`src/docs_rs/use_case/mod.rs`) and the integration tests share these
+files via different relative paths, so the filenames must stay
+stable.
 
 ### `ruzstd` (pure Rust), not `zstd` (libzstd C binding)
 
 Chosen deliberately: `ruzstd` 0.8+ has both decoder _and_ encoder, so
-the format-version-mismatch test can recompress a mutated fixture
+the `search_crate_docs_reports_format_version_unsupported` test can
+recompress a mutated fixture
 without pulling in a C dep. Don't switch to the `zstd` crate without a
 concrete reason — the C binding adds a build-system surface for
 marginal speed gain on payloads that already decompress in single-digit

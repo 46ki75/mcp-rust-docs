@@ -17,9 +17,11 @@ pub use self::output::{
 };
 
 use crate::docs_rs::repository::{
-    DocsRsRepository, FetchCrateDocsRepositoryInput, FetchCrateDocsRepositoryOutput,
-    FetchRustdocJsonRepositoryInput, FetchRustdocJsonRepositoryOutput,
+    DocsRsRepository, DocsRsRepositoryError, FetchCrateDocsRepositoryInput,
+    FetchCrateDocsRepositoryOutput, FetchRustdocJsonRepositoryInput,
+    FetchRustdocJsonRepositoryOutput, SUPPORTED_FORMAT_VERSIONS,
 };
+use crate::docs_rs::schema::{DocsRsItemKind, DocsRsItemSummary};
 
 const DEFAULT_VERSION: &str = "latest";
 
@@ -223,14 +225,19 @@ impl DocsRsUseCase {
             .unwrap_or(DEFAULT_DOC_SEARCH_LIMIT)
             .clamp(1, MAX_DOC_SEARCH_LIMIT) as usize;
 
-        let url = build_rustdoc_json_url(&self.base_url, &crate_name, &version);
-
+        // Try each supported format version in order. docs.rs serves
+        // a given crate at whatever format version it was last built
+        // against, which varies across the ecosystem (popular crates
+        // are usually current, but lagging ones may be a format
+        // behind). A 404 on the preferred version is the routine case
+        // for those lagging crates; any other repository error is
+        // terminal and short-circuits the chain. All-404 across the
+        // chain becomes `FormatVersionUnavailable`.
         let FetchRustdocJsonRepositoryOutput {
             final_url,
             crate_json,
         } = self
-            .repository
-            .fetch_rustdoc_json(FetchRustdocJsonRepositoryInput { url })
+            .fetch_rustdoc_with_fallback(&crate_name, &version)
             .await?;
 
         let resolved_version = parse_rustdoc_json_version(&self.base_url, &crate_name, &final_url);
@@ -326,6 +333,49 @@ impl DocsRsUseCase {
             truncated,
             items,
         })
+    }
+
+    /// Walk the supported-format list, fetching each URL until one
+    /// succeeds. `NotFound` is the only error we treat as a fallback
+    /// trigger; every other repository error short-circuits because it
+    /// indicates a real problem (network failure, malformed payload,
+    /// upstream 5xx) that retrying at a different format wouldn't fix.
+    async fn fetch_rustdoc_with_fallback(
+        &self,
+        crate_name: &str,
+        version: &str,
+    ) -> Result<FetchRustdocJsonRepositoryOutput, DocsRsUseCaseError> {
+        let mut last_not_found: Option<DocsRsRepositoryError> = None;
+        for &fv in SUPPORTED_FORMAT_VERSIONS {
+            let url = build_rustdoc_json_url(&self.base_url, crate_name, version, fv);
+            match self
+                .repository
+                .fetch_rustdoc_json(FetchRustdocJsonRepositoryInput { url })
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(DocsRsRepositoryError::NotFound { url }) => {
+                    last_not_found = Some(DocsRsRepositoryError::NotFound { url });
+                    continue;
+                }
+                Err(other) => return Err(DocsRsUseCaseError::Repository(other)),
+            }
+        }
+        // Defensive: SUPPORTED_FORMAT_VERSIONS is non-empty at build
+        // time, so `last_not_found` must be `Some` here. Fall back to
+        // a generic NotFound on the (impossible) empty case so the
+        // type-checker stays happy without an `unreachable!`.
+        if last_not_found.is_some() {
+            Err(DocsRsUseCaseError::FormatVersionUnavailable {
+                crate_name: crate_name.to_string(),
+                tried: SUPPORTED_FORMAT_VERSIONS.to_vec(),
+            })
+        } else {
+            Err(DocsRsUseCaseError::FormatVersionUnavailable {
+                crate_name: crate_name.to_string(),
+                tried: Vec::new(),
+            })
+        }
     }
 }
 
@@ -461,21 +511,38 @@ fn build_all_html_url(base_url: &str, crate_name: &str, version: &str) -> String
     build_url(base_url, crate_name, version, Some("all.html"))
 }
 
-/// Build the docs.rs rustdoc-JSON URL. Shape:
-/// `{base}/crate/{crate}/{version}/json.zst`. Note the leading
-/// `/crate/` segment — this is a *different* docs.rs endpoint family
-/// from the rendered-HTML routes used by `fetch_crate_docs` and is
-/// NOT under the lib-name path. The `.zst` suffix selects the
-/// zstd-compressed variant (much smaller than `/json`).
-fn build_rustdoc_json_url(base_url: &str, crate_name: &str, version: &str) -> String {
+/// Build the docs.rs rustdoc-JSON URL for a specific format version.
+/// Shape: `{base}/crate/{crate}/{version}/json/{format_version}.zst`.
+///
+/// Two non-obvious pieces:
+///
+/// 1. The leading `/crate/` segment — this is a *different* docs.rs
+///    endpoint family from the rendered-HTML routes used by
+///    `fetch_crate_docs`, and is NOT under the lib-name path.
+/// 2. The `{format_version}` segment routes to a specific rustdoc-JSON
+///    schema build. docs.rs maintains multiple format-version builds
+///    per crate depending on when each was last rebuilt; without this
+///    segment the default `/json.zst` endpoint returns "whatever's
+///    latest", which may be a schema this build doesn't model and
+///    produces cryptic `missing field` errors. With it, the call
+///    either succeeds at the requested format or returns a clean 404
+///    that the use case translates into the fallback chain.
+///
+/// The `.zst` suffix selects the zstd-compressed variant.
+fn build_rustdoc_json_url(
+    base_url: &str,
+    crate_name: &str,
+    version: &str,
+    format_version: u32,
+) -> String {
     let base = base_url.trim_end_matches('/');
-    format!("{base}/crate/{crate_name}/{version}/json.zst")
+    format!("{base}/crate/{crate_name}/{version}/json/{format_version}.zst")
 }
 
 /// Parse the concrete version out of the redirected rustdoc-JSON URL.
 /// docs.rs serves `latest` by redirect, same as the HTML routes; the
-/// final URL is `{base}/crate/{crate}/{version}/json.zst`, so the
-/// version sits in the third path segment after the base.
+/// final URL is `{base}/crate/{crate}/{version}/json/{format}.zst`, so
+/// the version sits in the third path segment after the base.
 fn parse_rustdoc_json_version(base_url: &str, crate_name: &str, final_url: &str) -> Option<String> {
     let prefix = format!("{}/crate/{crate_name}/", base_url.trim_end_matches('/'));
     let rest = final_url.strip_prefix(&prefix)?;
@@ -502,15 +569,15 @@ fn validate_doc_search_query(query: &str) -> Result<String, DocsRsUseCaseError> 
     Ok(query.to_string())
 }
 
-/// Map a [`rustdoc_types::ItemSummary`] onto the normalised kind
-/// string and the URL-path tail under the crate's docs root.
+/// Map a [`DocsRsItemSummary`] onto the normalised kind string and the
+/// URL-path tail under the crate's docs root.
 ///
 /// Returns `None` for kinds that don't have a dedicated page (impls,
-/// fields, variants, use-statements, etc.) or kinds we don't model.
-/// Filtering on `None` keeps the search results to items the caller can
-/// actually open with `get_crate_docs`.
-fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String, String)> {
-    use rustdoc_types::ItemKind;
+/// fields, variants, use-statements, etc.) — those collapse to
+/// [`DocsRsItemKind::Other`] during normalization. Filtering on `None`
+/// keeps the search results to items the caller can actually open with
+/// `get_crate_docs`.
+fn rustdoc_kind_and_path(summary: &DocsRsItemSummary) -> Option<(String, String)> {
     // `path[0]` is the crate lib name; drop it so the URL becomes
     // relative to the crate docs root. `last` is the item's own name.
     let mut segments = summary.path.iter();
@@ -531,30 +598,31 @@ fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String
     };
 
     let (kind_str, filename) = match &summary.kind {
-        ItemKind::Module => ("module", format!("{}{last}/index.html", dir)),
-        ItemKind::Struct => ("struct", format!("{dir}struct.{last}.html")),
-        ItemKind::Union => ("union", format!("{dir}union.{last}.html")),
-        ItemKind::Enum => ("enum", format!("{dir}enum.{last}.html")),
-        ItemKind::Function => ("fn", format!("{dir}fn.{last}.html")),
-        ItemKind::TypeAlias => ("type", format!("{dir}type.{last}.html")),
-        ItemKind::Constant => ("constant", format!("{dir}constant.{last}.html")),
-        ItemKind::Trait => ("trait", format!("{dir}trait.{last}.html")),
-        ItemKind::TraitAlias => ("traitalias", format!("{dir}traitalias.{last}.html")),
-        ItemKind::Static => ("static", format!("{dir}static.{last}.html")),
-        ItemKind::Macro => ("macro", format!("{dir}macro.{last}.html")),
-        ItemKind::ProcDerive => ("derive", format!("{dir}derive.{last}.html")),
-        ItemKind::ProcAttribute => ("attribute", format!("{dir}attr.{last}.html")),
+        DocsRsItemKind::Module => ("module", format!("{}{last}/index.html", dir)),
+        DocsRsItemKind::Struct => ("struct", format!("{dir}struct.{last}.html")),
+        DocsRsItemKind::Union => ("union", format!("{dir}union.{last}.html")),
+        DocsRsItemKind::Enum => ("enum", format!("{dir}enum.{last}.html")),
+        DocsRsItemKind::Function => ("fn", format!("{dir}fn.{last}.html")),
+        DocsRsItemKind::TypeAlias => ("type", format!("{dir}type.{last}.html")),
+        DocsRsItemKind::Constant => ("constant", format!("{dir}constant.{last}.html")),
+        DocsRsItemKind::Trait => ("trait", format!("{dir}trait.{last}.html")),
+        DocsRsItemKind::TraitAlias => ("traitalias", format!("{dir}traitalias.{last}.html")),
+        DocsRsItemKind::Static => ("static", format!("{dir}static.{last}.html")),
+        DocsRsItemKind::Macro => ("macro", format!("{dir}macro.{last}.html")),
+        DocsRsItemKind::ProcDerive => ("derive", format!("{dir}derive.{last}.html")),
+        DocsRsItemKind::ProcAttribute => ("attribute", format!("{dir}attr.{last}.html")),
         // `Attribute` (core's built-in attribute docs, e.g.
         // `#[no_mangle]`) uses the same `attr.{name}.html` URL shape as
         // `ProcAttribute`. Bundled under the same `"attribute"` kind so
         // a `kinds: ["attribute"]` filter covers both.
-        ItemKind::Attribute => ("attribute", format!("{dir}attr.{last}.html")),
-        ItemKind::Primitive => ("primitive", format!("{dir}primitive.{last}.html")),
-        ItemKind::Keyword => ("keyword", format!("{dir}keyword.{last}.html")),
+        DocsRsItemKind::Attribute => ("attribute", format!("{dir}attr.{last}.html")),
+        DocsRsItemKind::Primitive => ("primitive", format!("{dir}primitive.{last}.html")),
+        DocsRsItemKind::Keyword => ("keyword", format!("{dir}keyword.{last}.html")),
         // Items without a dedicated page (impls, fields, variants,
         // assoc-types/consts, use-statements, extern-crate /
-        // extern-type) are skipped.
-        _ => return None,
+        // extern-type, and any future kinds we don't model) are
+        // skipped.
+        DocsRsItemKind::Other => return None,
     };
     Some((kind_str.to_string(), filename))
 }
@@ -563,7 +631,7 @@ fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String
 /// name (path[0]) so output matches what `search_crate_symbols`
 /// returns — `de::value::U8Deserializer`, not
 /// `serde::de::value::U8Deserializer`.
-fn qualified_name_from_summary(summary: &rustdoc_types::ItemSummary) -> String {
+fn qualified_name_from_summary(summary: &DocsRsItemSummary) -> String {
     summary
         .path
         .iter()
@@ -1597,11 +1665,13 @@ mod tests {
 
     #[test]
     fn build_rustdoc_json_url_uses_crate_endpoint() {
-        let u = build_rustdoc_json_url(BASE_URL, "tokio-util", "0.7.10");
+        let u = build_rustdoc_json_url(BASE_URL, "tokio-util", "0.7.10", 57);
         // Note the `/crate/` prefix — this is the docs.rs metadata
         // endpoint, NOT the lib-name path used by `fetch_crate_docs`.
-        // No hyphen→underscore translation either.
-        assert_eq!(u, "https://docs.rs/crate/tokio-util/0.7.10/json.zst");
+        // No hyphen→underscore translation. The trailing `/json/57.zst`
+        // pins the schema version so the use case only gets bytes it
+        // can deserialize.
+        assert_eq!(u, "https://docs.rs/crate/tokio-util/0.7.10/json/57.zst");
     }
 
     #[test]
@@ -1609,7 +1679,7 @@ mod tests {
         let v = parse_rustdoc_json_version(
             BASE_URL,
             "serde",
-            "https://docs.rs/crate/serde/1.0.219/json.zst",
+            "https://docs.rs/crate/serde/1.0.219/json/57.zst",
         );
         assert_eq!(v.as_deref(), Some("1.0.219"));
     }
@@ -1711,16 +1781,14 @@ mod tests {
 
     #[test]
     fn rustdoc_kind_and_path_maps_attribute() {
-        // `ItemKind::Attribute` is core's built-in attribute documentation
-        // (e.g. `#[no_mangle]`, `#[repr]`); rustdoc emits an
-        // `attr.{name}.html` page for it, the same shape as `ProcAttribute`.
-        // Currently this kind falls through to the catch-all `_ => None`,
-        // so built-in attribute items are silently dropped from search
-        // results even though they're addressable pages.
-        let summary = rustdoc_types::ItemSummary {
+        // `DocsRsItemKind::Attribute` covers core's built-in attribute
+        // documentation (e.g. `#[no_mangle]`, `#[repr]`); rustdoc emits
+        // an `attr.{name}.html` page for it, the same shape as
+        // `ProcAttribute`.
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec!["core".into(), "no_mangle".into()],
-            kind: rustdoc_types::ItemKind::Attribute,
+            kind: DocsRsItemKind::Attribute,
         };
         let (kind, path) =
             rustdoc_kind_and_path(&summary).expect("Attribute must map to a doc page");
@@ -1730,7 +1798,7 @@ mod tests {
 
     #[test]
     fn rustdoc_kind_and_path_maps_struct() {
-        let summary = rustdoc_types::ItemSummary {
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec![
                 "serde".into(),
@@ -1738,7 +1806,7 @@ mod tests {
                 "value".into(),
                 "U8Deserializer".into(),
             ],
-            kind: rustdoc_types::ItemKind::Struct,
+            kind: DocsRsItemKind::Struct,
         };
         let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
         assert_eq!(kind, "struct");
@@ -1747,10 +1815,10 @@ mod tests {
 
     #[test]
     fn rustdoc_kind_and_path_maps_module_to_index_html() {
-        let summary = rustdoc_types::ItemSummary {
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec!["serde".into(), "de".into(), "value".into()],
-            kind: rustdoc_types::ItemKind::Module,
+            kind: DocsRsItemKind::Module,
         };
         let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
         assert_eq!(kind, "module");
@@ -1759,10 +1827,10 @@ mod tests {
 
     #[test]
     fn rustdoc_kind_and_path_maps_trait_at_crate_root() {
-        let summary = rustdoc_types::ItemSummary {
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec!["serde".into(), "Deserialize".into()],
-            kind: rustdoc_types::ItemKind::Trait,
+            kind: DocsRsItemKind::Trait,
         };
         let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
         assert_eq!(kind, "trait");
@@ -1771,35 +1839,32 @@ mod tests {
 
     #[test]
     fn rustdoc_kind_and_path_skips_crate_root() {
-        let summary = rustdoc_types::ItemSummary {
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec!["serde".into()],
-            kind: rustdoc_types::ItemKind::Module,
+            kind: DocsRsItemKind::Module,
         };
         assert!(rustdoc_kind_and_path(&summary).is_none());
     }
 
     #[test]
-    fn rustdoc_kind_and_path_skips_non_addressable_kinds() {
-        for kind in [
-            rustdoc_types::ItemKind::Impl,
-            rustdoc_types::ItemKind::StructField,
-            rustdoc_types::ItemKind::Variant,
-            rustdoc_types::ItemKind::AssocConst,
-            rustdoc_types::ItemKind::AssocType,
-        ] {
-            let summary = rustdoc_types::ItemSummary {
-                crate_id: 0,
-                path: vec!["serde".into(), "Foo".into()],
-                kind,
-            };
-            assert!(rustdoc_kind_and_path(&summary).is_none());
-        }
+    fn rustdoc_kind_and_path_skips_other_kind() {
+        // Impls / fields / variants / assoc-items / extern-crate / use /
+        // extern-type all collapse to `DocsRsItemKind::Other` during
+        // upstream normalization (see `schema::impl_from_upstream`).
+        // The walker must drop them — they don't have dedicated doc
+        // pages we can address.
+        let summary = DocsRsItemSummary {
+            crate_id: 0,
+            path: vec!["serde".into(), "Foo".into()],
+            kind: DocsRsItemKind::Other,
+        };
+        assert!(rustdoc_kind_and_path(&summary).is_none());
     }
 
     #[test]
     fn qualified_name_strips_crate_lib_segment() {
-        let summary = rustdoc_types::ItemSummary {
+        let summary = DocsRsItemSummary {
             crate_id: 0,
             path: vec![
                 "serde".into(),
@@ -1807,7 +1872,7 @@ mod tests {
                 "value".into(),
                 "U8Deserializer".into(),
             ],
-            kind: rustdoc_types::ItemKind::Struct,
+            kind: DocsRsItemKind::Struct,
         };
         assert_eq!(
             qualified_name_from_summary(&summary),
@@ -1833,13 +1898,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_crate_docs_targets_crate_json_endpoint() {
+    async fn search_crate_docs_walks_fallback_chain_on_not_found() {
         let stub = Arc::new(DocsRsRepositoryStub::new());
         let use_case = use_case_with(stub.clone());
-        // No JSON enqueued; stub returns NotFound for us. We only care
-        // here that the URL the use case built was the rustdoc-JSON
-        // endpoint, not the lib-name path.
-        let _ = use_case
+        // No JSON enqueued — every fetch returns NotFound, so the use
+        // case is forced to walk all supported format versions before
+        // giving up. We're pinning two contracts:
+        //   1. URLs hit the `/crate/.../json/{format}.zst` shape
+        //      (not the rendered-HTML lib-name path).
+        //   2. Format versions are tried in `SUPPORTED_FORMAT_VERSIONS`
+        //      order (highest first, lagging-format fallback after).
+        let err = use_case
             .search_crate_docs(SearchCrateDocsUseCaseInput {
                 crate_name: "tokio-util".into(),
                 version: Some("0.7.10".into()),
@@ -1847,20 +1916,29 @@ mod tests {
                 kinds: None,
                 limit: None,
             })
-            .await;
-        assert_eq!(
-            stub.last_seen_url().await.as_deref(),
-            Some("https://docs.rs/crate/tokio-util/0.7.10/json.zst"),
-        );
+            .await
+            .expect_err("all-NotFound should surface FormatVersionUnavailable");
+        assert!(matches!(
+            err,
+            DocsRsUseCaseError::FormatVersionUnavailable { .. }
+        ));
+
+        let expected: Vec<String> = SUPPORTED_FORMAT_VERSIONS
+            .iter()
+            .map(|fv| format!("https://docs.rs/crate/tokio-util/0.7.10/json/{fv}.zst"))
+            .collect();
+        assert_eq!(stub.seen_urls().await, expected);
     }
 
     /// End-to-end use-case test against the real anyhow rustdoc-JSON
-    /// fixture (decompressed in-process via ruzstd). Complements the
-    /// transport-level test in `tests/search_crate_docs.rs` by exercising
-    /// ranking, snippet generation, and the kind filter without
-    /// spinning up an MCP server or wiremock.
+    /// fixture (decompressed in-process via ruzstd, then normalized
+    /// via the format-57 [`From`] impl). Complements the transport-level
+    /// test in `tests/search_crate_docs.rs` by exercising ranking,
+    /// snippet generation, and the kind filter without spinning up an
+    /// MCP server or wiremock.
     #[tokio::test]
     async fn search_crate_docs_against_anyhow_fixture_returns_ranked_hits() -> anyhow::Result<()> {
+        use crate::docs_rs::schema::DocsRsCrate;
         use std::io::Read;
         // Path is relative to this file. The integration test in
         // `tests/search_crate_docs.rs` uses the same fixture via a
@@ -1869,12 +1947,15 @@ mod tests {
         let mut decoder = ruzstd::decoding::StreamingDecoder::new(FIXTURE)?;
         let mut decompressed = Vec::with_capacity(512 * 1024);
         decoder.read_to_end(&mut decompressed)?;
-        let crate_json: Arc<rustdoc_types::Crate> =
-            Arc::new(serde_json::from_slice(&decompressed)?);
+        let upstream: rustdoc_types::Crate = serde_json::from_slice(&decompressed)?;
+        let crate_json: Arc<DocsRsCrate> = Arc::new(DocsRsCrate::from(upstream));
 
         let stub = Arc::new(DocsRsRepositoryStub::new());
         stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
-            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            final_url: format!(
+                "https://docs.rs/crate/anyhow/1.0.86/json/{}.zst",
+                rustdoc_types::FORMAT_VERSION,
+            ),
             crate_json,
         }))
         .await;
@@ -1920,48 +2001,25 @@ mod tests {
     /// for an unrelated reason.
     #[tokio::test]
     async fn search_crate_docs_filters_foreign_crate_items() -> anyhow::Result<()> {
+        use crate::docs_rs::schema::{DocsRsCrate, DocsRsItem};
         const SENTINEL: &str = "qqzzqq_unique_search_token";
-        let synthetic_id = rustdoc_types::Id(9_900_001);
+        let synthetic_id: u32 = 9_900_001;
 
-        let make_crate = |summary_crate_id: u32| -> Arc<rustdoc_types::Crate> {
-            let mut c = rustdoc_types::Crate {
-                root: rustdoc_types::Id(0),
-                crate_version: None,
-                includes_private: false,
-                index: Default::default(),
-                paths: Default::default(),
-                external_crates: Default::default(),
-                target: rustdoc_types::Target {
-                    triple: "x86_64-unknown-linux-gnu".into(),
-                    target_features: Vec::new(),
-                },
-                format_version: rustdoc_types::FORMAT_VERSION,
-            };
+        let make_crate = |summary_crate_id: u32| -> Arc<DocsRsCrate> {
+            let mut c = DocsRsCrate::default();
             c.index.insert(
                 synthetic_id,
-                rustdoc_types::Item {
-                    id: synthetic_id,
-                    crate_id: summary_crate_id,
+                DocsRsItem {
                     name: Some("ForeignThing".into()),
-                    span: None,
-                    visibility: rustdoc_types::Visibility::Public,
                     docs: Some(format!("This struct mentions {SENTINEL} for the test.")),
-                    links: Default::default(),
-                    attrs: Vec::new(),
-                    deprecation: None,
-                    // `ExternType` is a unit variant — saves us from
-                    // constructing a real `Struct`. The use case reads
-                    // only `item.docs` / `item.name` from the index;
-                    // kind comes from the summary below.
-                    inner: rustdoc_types::ItemEnum::ExternType,
                 },
             );
             c.paths.insert(
                 synthetic_id,
-                rustdoc_types::ItemSummary {
+                DocsRsItemSummary {
                     crate_id: summary_crate_id,
                     path: vec!["other_crate".into(), "ForeignThing".into()],
-                    kind: rustdoc_types::ItemKind::Struct,
+                    kind: DocsRsItemKind::Struct,
                 },
             );
             Arc::new(c)
@@ -1970,7 +2028,7 @@ mod tests {
         // Phase 1: foreign item (crate_id = 1) — must be filtered out.
         let stub = Arc::new(DocsRsRepositoryStub::new());
         stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
-            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            final_url: "https://docs.rs/crate/anyhow/1.0.86/json/57.zst".into(),
             crate_json: make_crate(1),
         }))
         .await;
@@ -1995,7 +2053,7 @@ mod tests {
         // / broken walk.
         let stub = Arc::new(DocsRsRepositoryStub::new());
         stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
-            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            final_url: "https://docs.rs/crate/anyhow/1.0.86/json/57.zst".into(),
             crate_json: make_crate(0),
         }))
         .await;

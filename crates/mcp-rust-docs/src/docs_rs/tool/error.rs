@@ -32,6 +32,14 @@ impl DocsRsToolError {
             })) => {
                 format!("Not found: docs.rs returned 404 for {url}")
             }
+            Self::UseCase(DocsRsUseCaseError::FormatVersionUnavailable { crate_name, tried }) => {
+                format!(
+                    "Not found: docs.rs has no rustdoc JSON for {crate_name} at any \
+                     format version this build understands (tried {tried:?}). The crate \
+                     may need to be rebuilt on docs.rs, or a newer mcp-rust-docs that \
+                     supports the current format may be required."
+                )
+            }
             Self::UseCase(DocsRsUseCaseError::Repository(err)) => {
                 format!("Upstream failure: {err}")
             }

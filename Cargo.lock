@@ -1148,7 +1148,8 @@ dependencies = [
  "moka",
  "reqwest 0.12.28",
  "rmcp",
- "rustdoc-types",
+ "rustdoc-types 0.56.0",
+ "rustdoc-types 0.57.3",
  "ruzstd",
  "schemars",
  "serde",
@@ -1807,6 +1808,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustdoc-types"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bf787c529efe523ed9eb6dcdbaa5954d34329f08d5c243fce928441826ca90"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

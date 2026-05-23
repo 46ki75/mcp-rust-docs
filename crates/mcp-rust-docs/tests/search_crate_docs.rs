@@ -73,7 +73,7 @@ async fn list_tools_advertises_search_crate_docs() -> anyhow::Result<()> {
 async fn search_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/crate/anyhow/latest/json.zst"))
+        .and(path("/crate/anyhow/latest/json/57.zst"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ANYHOW_JSON_ZST.to_vec(), "application/zstd"),
         )
@@ -148,7 +148,7 @@ async fn search_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
 async fn search_crate_docs_filters_by_kind() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/crate/anyhow/latest/json.zst"))
+        .and(path("/crate/anyhow/latest/json/57.zst"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ANYHOW_JSON_ZST.to_vec(), "application/zstd"),
         )
@@ -235,9 +235,17 @@ async fn search_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow:
 async fn search_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/crate/nonexistent/latest/json.zst"))
+        // The use case walks every supported format version on
+        // NotFound, so a missing crate hits every URL in the chain.
+        // Match all of them with a regex against the path prefix.
+        .and(wiremock::matchers::path_regex(
+            r"^/crate/nonexistent/latest/json/\d+\.zst$",
+        ))
         .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
-        .expect(1)
+        // Exactly two upstream calls: one per supported format version
+        // (currently 57, 56). If a new version joins the dispatch list
+        // this expectation needs to bump in lockstep.
+        .expect(2)
         .mount(&mock)
         .await;
 
@@ -274,17 +282,20 @@ async fn search_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn search_crate_docs_reports_format_version_mismatch() -> anyhow::Result<()> {
+async fn search_crate_docs_reports_format_version_unsupported() -> anyhow::Result<()> {
     // Take the real anyhow fixture, decompress it, swap only
-    // `format_version` to a value the repo cannot understand, then
-    // recompress. This way every other field is still valid rustdoc
-    // JSON and we exercise the dedicated format-version check rather
-    // than tripping over a generic parse failure on something else.
+    // `format_version` to a value the dispatch table doesn't know,
+    // then recompress. Every other field is still valid rustdoc JSON,
+    // so the failure must come from `FormatVersionUnsupported` (the
+    // dispatch path), not from a generic deserialize error. Verifying
+    // this distinction is the whole point of the test — agents need
+    // to be able to tell "I asked for a format docs.rs doesn't have"
+    // apart from "the bytes are garbage."
     let mutated = mutate_format_version(ANYHOW_JSON_ZST, 99_999_999);
 
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/crate/anyhow/latest/json.zst"))
+        .and(path("/crate/anyhow/latest/json/57.zst"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(mutated, "application/zstd"))
         .expect(1)
         .mount(&mock)
@@ -313,12 +324,85 @@ async fn search_crate_docs_reports_format_version_mismatch() -> anyhow::Result<(
         .map(|t| t.text.clone())
         .expect("text content");
     // The tool error formatter wraps repository errors with
-    // "Upstream failure:". The format-version mismatch's Display
-    // message names both versions so the user knows which side is
-    // out of date.
+    // "Upstream failure:". The FormatVersionUnsupported Display message
+    // names the actual format AND the supported set so the user knows
+    // both which side is out of date and what their options are.
     assert!(
         text.contains("format_version") && text.contains("99999999"),
-        "expected format-version diagnostic naming both versions, got: {text}",
+        "expected format-version diagnostic naming the actual version, got: {text}",
+    );
+    assert!(
+        text.contains("only supports"),
+        "expected 'only supports' phrasing listing dispatched versions, got: {text}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// End-to-end proof of the format-version fallback chain. The first
+/// URL (`/json/57.zst`) 404s; the second (`/json/56.zst`) returns a
+/// real format-56 fixture (serde's JSON), and the use case dispatches
+/// it via the renamed `rustdoc-types-56` deserializer. Result:
+/// `search_crate_docs` succeeds against a crate that docs.rs hasn't
+/// yet rebuilt at the current format — exactly the serde case that
+/// motivated the multi-version architecture.
+#[tokio::test]
+async fn search_crate_docs_falls_back_to_older_format_version() -> anyhow::Result<()> {
+    const SERDE_JSON_ZST: &[u8] = include_bytes!("fixtures/serde_rustdoc.json.zst");
+
+    let mock = MockServer::start().await;
+    // 1. Newer format isn't built yet for this crate — 404.
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/57.zst"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // 2. Older format is built — fall through, dispatch via
+    //    rustdoc-types-56, get hits.
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/56.zst"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(SERDE_JSON_ZST.to_vec(), "application/zstd"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "deserialize",
+                "limit": 5,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "fallback chain failed: {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    let total: u64 = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "serde matched 0 doc hits for 'deserialize' — fallback didn't deliver normalized data: {parsed}",
     );
 
     client.cancel().await?;
@@ -360,7 +444,7 @@ fn encode_zstd(data: &[u8]) -> Vec<u8> {
 async fn second_search_crate_docs_call_is_served_from_cache() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/crate/anyhow/latest/json.zst"))
+        .and(path("/crate/anyhow/latest/json/57.zst"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(ANYHOW_JSON_ZST.to_vec(), "application/zstd"),
         )

@@ -270,6 +270,54 @@ async fn live_search_crate_docs_finds_anyhow_error_mentions() -> anyhow::Result<
     Ok(())
 }
 
+/// Live counterpart to the hermetic
+/// `search_crate_docs_falls_back_to_older_format_version` test. Hits
+/// real docs.rs against serde — which (as of 2026-05) only has a
+/// format-56 build, so success here proves the fallback chain
+/// dispatches via `rustdoc-types-56` against real upstream bytes, not
+/// just wiremock. May start hitting the format-57 path if/when docs.rs
+/// rebuilds serde; the assertion only checks that *some* dispatch path
+/// succeeds, so a rebuild won't flake it.
+#[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_search_crate_docs_falls_back_through_serde() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "deserialize",
+                "limit": 3,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live serde lookup failed (fallback chain didn't reach a supported format): {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    let total = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "expected at least one hit for `deserialize` in serde: {parsed}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {

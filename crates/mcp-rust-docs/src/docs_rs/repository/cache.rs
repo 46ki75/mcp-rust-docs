@@ -83,7 +83,7 @@ impl Default for CachingDocsRsRepositoryConfig {
 ///
 /// The cache stores `FetchRustdocJsonRepositoryOutput` by value, NOT
 /// wrapped in `Arc`. This is safe and cheap *because* the heavy
-/// `rustdoc_types::Crate` already lives behind an `Arc` inside the
+/// normalized `DocsRsCrate` already lives behind an `Arc` inside the
 /// struct, so cloning the output on each hit just bumps the refcount
 /// on the big payload and copies a single small `String`
 /// (`final_url`). If the output struct ever grows a non-`Arc` heavy
@@ -233,16 +233,17 @@ mod tests {
         })
     }
 
-    /// Decompress and parse the real anyhow fixture once per test
-    /// process. The cache stores the `Arc<Crate>` opaquely — its
+    /// Decompress and normalize the real anyhow fixture once per test
+    /// process. The cache stores the `Arc<DocsRsCrate>` opaquely — its
     /// contents aren't inspected here, but constructing a valid
-    /// `rustdoc_types::Crate` by hand requires keeping up with every
-    /// new field the upstream adds, so it's simpler to reuse the
-    /// fixture the integration tests already maintain.
-    fn stub_crate() -> Arc<rustdoc_types::Crate> {
+    /// `DocsRsCrate` by hand for a realistic-sized crate would be
+    /// tedious, so we reuse the fixture the integration tests already
+    /// maintain.
+    fn stub_crate() -> Arc<crate::docs_rs::schema::DocsRsCrate> {
+        use crate::docs_rs::schema::DocsRsCrate;
         use std::io::Read;
         use std::sync::OnceLock;
-        static CACHED: OnceLock<Arc<rustdoc_types::Crate>> = OnceLock::new();
+        static CACHED: OnceLock<Arc<DocsRsCrate>> = OnceLock::new();
         CACHED
             .get_or_init(|| {
                 const FIXTURE: &[u8] =
@@ -253,7 +254,9 @@ mod tests {
                 decoder
                     .read_to_end(&mut decompressed)
                     .expect("zstd read_to_end");
-                Arc::new(serde_json::from_slice(&decompressed).expect("parse anyhow fixture"))
+                let upstream: rustdoc_types::Crate =
+                    serde_json::from_slice(&decompressed).expect("parse anyhow fixture");
+                Arc::new(DocsRsCrate::from(upstream))
             })
             .clone()
     }
@@ -394,11 +397,12 @@ mod tests {
 
     /// Regression test for the load-bearing property behind storing
     /// `FetchRustdocJsonRepositoryOutput` by value (not behind an
-    /// outer `Arc`): the heavy `rustdoc_types::Crate` payload lives
+    /// outer `Arc`): the heavy normalized `DocsRsCrate` payload lives
     /// behind its own `Arc` inside the struct, so a cache hit must
     /// bump the inner refcount, not deep-clone a multi-MB structure.
-    /// If a future change inlines `Crate` by value, this assertion
-    /// fails — catching the silent perf regression at test time.
+    /// If a future change inlines `DocsRsCrate` by value, this
+    /// assertion fails — catching the silent perf regression at test
+    /// time.
     #[tokio::test]
     async fn cache_hits_share_the_inner_crate_arc() {
         let inner = Arc::new(CountingRepo::new(ok_output));
