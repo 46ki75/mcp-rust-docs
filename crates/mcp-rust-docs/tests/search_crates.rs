@@ -83,7 +83,7 @@ async fn search_crates_returns_parsed_results() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -131,7 +131,7 @@ async fn search_crates_reports_upstream_http_errors() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -159,7 +159,7 @@ async fn search_crates_reports_upstream_http_errors() -> anyhow::Result<()> {
 #[tokio::test]
 async fn list_tools_advertises_search_crates() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let tools = client.list_all_tools().await?;

@@ -98,6 +98,63 @@ async fn live_search_returns_serde_from_crates_io() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_get_crate_docs_returns_markdown_for_serde_root() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "serde" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    // docs.rs always redirects `/latest/` to a concrete version — the
+    // use case should have parsed it out of the final URL.
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    let md = parsed["markdown"].as_str().expect("markdown string");
+    // After <main> extraction, the markdown should be the crate-root
+    // prose only — that always names the crate. If this stops being
+    // true, the extraction heuristic has broken.
+    assert!(
+        md.to_lowercase().contains("serde"),
+        "live markdown missing crate name: {}",
+        &md.chars().take(500).collect::<String>(),
+    );
+    // Sidebar markers ("All Items", "Crate Items", search box widgets)
+    // should be gone after extraction. Catching their reappearance
+    // would tell us the upstream HTML shape drifted and we're shipping
+    // full-page markdown again.
+    assert!(
+        !md.contains("Crate Items") && !md.contains("In crate "),
+        "sidebar chrome leaked into extracted markdown: {}",
+        &md.chars().take(500).collect::<String>(),
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {
     let server = Server::new()?;

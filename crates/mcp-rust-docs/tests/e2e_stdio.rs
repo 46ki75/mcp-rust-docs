@@ -63,6 +63,8 @@ async fn spawn_stdio_child(
     let command = tokio::process::Command::new(bin).configure(|cmd| {
         cmd.arg("stdio")
             .env("MCP_CRATES_IO_BASE_URL", &upstream)
+            // Same wiremock URL serves both endpoints in tests.
+            .env("MCP_DOCS_RS_BASE_URL", &upstream)
             // Keep the child's stderr quiet; tracing at info level would
             // otherwise spam the test output.
             .env("RUST_LOG", "error");
@@ -79,10 +81,56 @@ async fn stdio_child_lists_search_crates_tool() -> anyhow::Result<()> {
     let client = spawn_stdio_child(&mock.uri()).await?;
 
     let tools = client.list_all_tools().await?;
+    let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(
-        tools.iter().any(|t| t.name == "search_crates"),
-        "search_crates not advertised by stdio child: {tools:?}",
+        names.contains(&"search_crates"),
+        "search_crates not advertised by stdio child: {names:?}",
     );
+    assert!(
+        names.contains(&"get_crate_docs"),
+        "get_crate_docs not advertised by stdio child: {names:?}",
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_child_returns_markdown_from_get_crate_docs() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/anyhow/latest/anyhow/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<main><h1>anyhow</h1></main>"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = spawn_stdio_child(&mock.uri()).await?;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "anyhow" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "anyhow");
+    let md = parsed["markdown"].as_str().expect("markdown string");
+    assert!(md.contains("anyhow"), "missing anyhow in markdown: {md}");
 
     client.cancel().await?;
     Ok(())

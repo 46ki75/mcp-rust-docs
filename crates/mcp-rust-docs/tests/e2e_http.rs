@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const DOCS_FIXTURE_HTML: &str =
+    "<main><h1>Module serde</h1><p>Serialize and deserialize.</p></main>";
+
 #[derive(Default, Clone)]
 struct TestClient;
 
@@ -99,7 +102,7 @@ async fn http_client_can_list_and_call_search_crates() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server_template = Server::builder().base_url(mock.uri()).build()?;
+    let server_template = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let http = spawn_http_server(server_template).await?;
 
     let transport = StreamableHttpClientTransport::from_uri(http.base_url.clone());
@@ -141,6 +144,57 @@ async fn http_client_can_list_and_call_search_crates() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn http_client_can_call_get_crate_docs() -> anyhow::Result<()> {
+    // Two mocks on the same server: crates.io path stays unmounted
+    // (this test never calls it), docs.rs path serves a tiny fixture.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/serde/latest/serde/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DOCS_FIXTURE_HTML))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let server_template = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .crates_io_base_url(mock.uri())
+        .build()?;
+    let http = spawn_http_server(server_template).await?;
+
+    let transport = StreamableHttpClientTransport::from_uri(http.base_url.clone());
+    let client = TestClient.serve(transport).await?;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "serde" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    let md = parsed["markdown"].as_str().expect("markdown string");
+    assert!(md.contains("Module serde"));
+
+    client.cancel().await?;
+    http.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn http_client_surfaces_upstream_errors_as_tool_errors() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
 
@@ -151,7 +205,7 @@ async fn http_client_surfaces_upstream_errors_as_tool_errors() -> anyhow::Result
         .mount(&mock)
         .await;
 
-    let server_template = Server::builder().base_url(mock.uri()).build()?;
+    let server_template = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let http = spawn_http_server(server_template).await?;
 
     let transport = StreamableHttpClientTransport::from_uri(http.base_url.clone());

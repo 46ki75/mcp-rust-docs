@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "MCP server exposing Rust ecosystem tools (starting with crates.io search)."
+description = "MCP server exposing Rust ecosystem tools: crates.io search and docs.rs documentation retrieval."
 
 [lints]
 workspace = true
@@ -19,6 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
+fast_html2md = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

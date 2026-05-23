@@ -9,7 +9,7 @@
 //! rewriting argv.
 
 use clap::{Args, Parser, Subcommand};
-use mcp_rust_docs::{CRATES_IO_BASE_URL, Server};
+use mcp_rust_docs::{CRATES_IO_BASE_URL, DOCS_RS_BASE_URL, Server};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -30,6 +30,16 @@ struct Cli {
         global = true,
     )]
     crates_io_base_url: String,
+
+    /// Upstream docs.rs base URL. Same use cases as the crates.io
+    /// override — wiremock fixtures, mirrors, proxies.
+    #[arg(
+        long,
+        env = "MCP_DOCS_RS_BASE_URL",
+        default_value = DOCS_RS_BASE_URL,
+        global = true,
+    )]
+    docs_rs_base_url: String,
 
     #[command(subcommand)]
     transport: Transport,
@@ -61,8 +71,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.transport {
-        Transport::Stdio => run_stdio(&cli.crates_io_base_url).await,
-        Transport::Http(args) => run_http(&cli.crates_io_base_url, &args.bind).await,
+        Transport::Stdio => run_stdio(&cli.crates_io_base_url, &cli.docs_rs_base_url).await,
+        Transport::Http(args) => {
+            run_http(&cli.crates_io_base_url, &cli.docs_rs_base_url, &args.bind).await
+        }
     }
 }
 
@@ -90,13 +102,18 @@ fn init_http_tracing() {
         .init();
 }
 
-async fn run_stdio(crates_io_base_url: &str) -> anyhow::Result<()> {
+async fn run_stdio(crates_io_base_url: &str, docs_rs_base_url: &str) -> anyhow::Result<()> {
     init_stdio_tracing();
 
-    tracing::info!(%crates_io_base_url, "starting mcp-rust-docs over stdio");
+    tracing::info!(
+        %crates_io_base_url,
+        %docs_rs_base_url,
+        "starting mcp-rust-docs over stdio",
+    );
 
     let server = Server::builder()
-        .base_url(crates_io_base_url.to_string())
+        .crates_io_base_url(crates_io_base_url.to_string())
+        .docs_rs_base_url(docs_rs_base_url.to_string())
         .build()?;
 
     let service = server.serve(stdio()).await.inspect_err(|err| {
@@ -107,16 +124,22 @@ async fn run_stdio(crates_io_base_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_http(crates_io_base_url: &str, bind_address: &str) -> anyhow::Result<()> {
+async fn run_http(
+    crates_io_base_url: &str,
+    docs_rs_base_url: &str,
+    bind_address: &str,
+) -> anyhow::Result<()> {
     init_http_tracing();
 
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let base_url = crates_io_base_url.to_string();
+    let crates_io = crates_io_base_url.to_string();
+    let docs_rs = docs_rs_base_url.to_string();
 
     let service = StreamableHttpService::new(
         move || {
             Server::builder()
-                .base_url(base_url.clone())
+                .crates_io_base_url(crates_io.clone())
+                .docs_rs_base_url(docs_rs.clone())
                 .build()
                 .map_err(std::io::Error::other)
         },
@@ -126,7 +149,12 @@ async fn run_http(crates_io_base_url: &str, bind_address: &str) -> anyhow::Resul
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
-    tracing::info!(%bind_address, %crates_io_base_url, "mcp-rust-docs listening at /mcp");
+    tracing::info!(
+        %bind_address,
+        %crates_io_base_url,
+        %docs_rs_base_url,
+        "mcp-rust-docs listening at /mcp",
+    );
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
