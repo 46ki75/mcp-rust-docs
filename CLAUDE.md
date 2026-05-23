@@ -9,20 +9,20 @@ An MCP (Model Context Protocol) server written in Rust on top of the
 
 - `search_crates` — crates.io registry search.
 - `get_crate_docs` — docs.rs HTML → Markdown for one page. On
-  *crate-root* calls (no `path`), also bundles a `metadata` block
+  _crate-root_ calls (no `path`), also bundles a `metadata` block
   fetched in parallel from crates.io: recent versions (capped at 20),
   the resolved version's `Cargo.toml` `[features]` map, and a
   dependency summary (per-kind counts plus the top runtime deps).
   Drill-down calls skip the metadata fetch — the agent has it from
-  the root call. Metadata is *best-effort*: a crates.io blip
-  populates `metadata_error` but the docs still ship. See *Composite
-  tool: `get_crate_docs`* below.
+  the root call. Metadata is _best-effort_: a crates.io blip
+  populates `metadata_error` but the docs still ship. See _Composite
+  tool: `get_crate_docs`_ below.
 - `search_crate_symbols` — name-based symbol index from rustdoc `all.html`.
 - `search_crate_docs` — full-text search over doc comments via docs.rs's
   zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json/{format_version}.zst`).
   Walks a fallback chain across supported `format_version`s so crates
   whose docs.rs build lags the current rustdoc schema (e.g. `serde`)
-  still work; see the *Multi-version rustdoc-JSON dispatch* section
+  still work; see the _Multi-version rustdoc-JSON dispatch_ section
   below.
 
 The crate ships as a single binary, `mcp-rust-docs`, with two transport
@@ -112,9 +112,9 @@ a second tool module.
 
 ### docs.rs has two distinct endpoint families — don't confuse them
 
-| Tool                                     | URL shape                                                                                                                          | Repository method    |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                                    | `fetch_crate_docs`   |
+| Tool                                     | URL shape                                                                                                                             | Repository method    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                                       | `fetch_crate_docs`   |
 | `search_crate_docs`                      | `{base}/crate/{crate}/{version}/json/{format_version}.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
 
 The leading `/crate/` segment and the absence of the lib-name path are
@@ -124,7 +124,7 @@ reason — don't try to unify them.
 
 The `/json/{format_version}` segment is required, not optional —
 docs.rs's bare `/json` returns "whatever's latest" for the crate,
-which has no relationship to what *this* build of `rustdoc-types` can
+which has no relationship to what _this_ build of `rustdoc-types` can
 deserialize. Pinning the segment guarantees we either get bytes we
 can parse or a clean 404 (which the use case routes into the fallback
 chain below).
@@ -134,8 +134,7 @@ chain below).
 docs.rs serves rustdoc-JSON at multiple schema versions depending on
 when each crate was last built. The ecosystem is **heterogeneous** at
 any given moment: popular/recent crates sit at the current
-`FORMAT_VERSION`, but lagging crates (notably `serde` as of early
-2026) stay one or more versions behind until rebuilt. There's no
+`FORMAT_VERSION`, but lagging crates (notably `serde` as of early 2026) stay one or more versions behind until rebuilt. There's no
 single version that works for all crates.
 
 To handle both ends without forking the upstream type definitions, we
@@ -232,7 +231,7 @@ test.
 
 ### Composite tool: `get_crate_docs`
 
-The only tool that crosses module boundaries. On a *crate-root* call
+The only tool that crosses module boundaries. On a _crate-root_ call
 (`path` is `None`) the handler runs two use cases in parallel via
 `tokio::join!`:
 
@@ -247,7 +246,7 @@ pin this.
 
 **Best-effort merging.** A metadata-only failure populates the
 response's `metadata_error` (the formatted error string) and leaves
-`metadata` absent. The tool result stays *success* — a crates.io
+`metadata` absent. The tool result stays _success_ — a crates.io
 blip must not kill a successful docs fetch, which is what the agent
 actually came for. A docs-fetch failure, by contrast, still surfaces
 as a tool error.
