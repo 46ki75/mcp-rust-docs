@@ -1,14 +1,16 @@
 //! MCP server exposing Rust ecosystem tools.
 //!
 //! Currently ships a single tool — `search_crates` — that queries
-//! the crates.io registry. Two binaries adapt this library to the
-//! two MCP transports an editor host will care about:
+//! the crates.io registry. A single binary, `mcp-rust-docs`, adapts
+//! this library to the two MCP transports an editor host cares about,
+//! selected by subcommand:
 //!
-//! - `mcp-rust-docs-stdio` — line-buffered JSON-RPC over stdin/stdout
-//! - `mcp-rust-docs-http`  — streamable-HTTP at `/mcp`
+//! - `mcp-rust-docs stdio` — line-buffered JSON-RPC over stdin/stdout
+//! - `mcp-rust-docs http`  — streamable HTTP at `/mcp`
 //!
-//! Both binaries read `MCP_CRATES_IO_BASE_URL` to override the
-//! upstream registry; useful for hermetic tests or registry mirrors.
+//! Both transports accept `--crates-io-base-url` (env
+//! `MCP_CRATES_IO_BASE_URL`) to override the upstream registry,
+//! useful for hermetic tests or registry mirrors.
 //!
 //! Internally the crate follows the repository / use case / tool
 //! layering documented in the org-wide Rust standards.

@@ -1,9 +1,10 @@
 //! End-to-end tests over the real stdio transport.
 //!
-//! Spawns the compiled `mcp-rust-docs-stdio` binary as a child process
-//! and drives it via rmcp's `TokioChildProcess` transport. The binary
-//! reads `MCP_CRATES_IO_BASE_URL` from the env, so each test points it
-//! at a wiremock-backed upstream — no traffic reaches real crates.io.
+//! Spawns the compiled `mcp-rust-docs` binary with the `stdio`
+//! subcommand and drives it via rmcp's `TokioChildProcess` transport.
+//! The binary reads `MCP_CRATES_IO_BASE_URL` from the env, so each
+//! test points it at a wiremock-backed upstream — no traffic reaches
+//! real crates.io.
 //!
 //! These complement `e2e_http.rs` (which exercises the streamable-HTTP
 //! transport in-process) and `search_crates.rs` (which uses an in-memory
@@ -56,11 +57,12 @@ async fn spawn_stdio_child(
     // matching `[[bin]]`. No need to invoke `cargo run` ourselves —
     // cargo has already built (and rebuilt-if-needed) the binary by the
     // time this test starts.
-    let bin = env!("CARGO_BIN_EXE_mcp-rust-docs-stdio");
+    let bin = env!("CARGO_BIN_EXE_mcp-rust-docs");
     let upstream = upstream_base_url.to_string();
 
     let command = tokio::process::Command::new(bin).configure(|cmd| {
-        cmd.env("MCP_CRATES_IO_BASE_URL", &upstream)
+        cmd.arg("stdio")
+            .env("MCP_CRATES_IO_BASE_URL", &upstream)
             // Keep the child's stderr quiet; tracing at info level would
             // otherwise spam the test output.
             .env("RUST_LOG", "error");

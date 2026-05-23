@@ -45,7 +45,7 @@ ci: fmt-check lint test
 ci-live: fmt-check lint test test-live
 
 run-stdio:
-    cargo run -p mcp-rust-docs --bin mcp-rust-docs-stdio
+    cargo run -p mcp-rust-docs -- stdio
 
 run-http:
-    cargo run -p mcp-rust-docs --bin mcp-rust-docs-http
+    cargo run -p mcp-rust-docs -- http
