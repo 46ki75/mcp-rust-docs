@@ -1,4 +1,5 @@
 ignores:
+  - "./.github/pull_request_template.md"
   - "./LICENSE"
   - "**/node_modules/**"
   - "./.agents/**"
