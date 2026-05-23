@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 pub use self::error::DocsRsUseCaseError;
 pub use self::input::{
-    FetchCrateDocsUseCaseInput, GrepCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
+    FetchCrateDocsUseCaseInput, SearchCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
 };
 pub use self::output::{
-    DocHit, FetchCrateDocsUseCaseOutput, GrepCrateDocsUseCaseOutput,
+    DocHit, FetchCrateDocsUseCaseOutput, SearchCrateDocsUseCaseOutput,
     SearchCrateSymbolsUseCaseOutput, SymbolEntry,
 };
 
@@ -47,17 +47,17 @@ const MAX_SYMBOL_QUERY_LEN: usize = 128;
 const DEFAULT_SYMBOL_LIMIT: u32 = 50;
 const MAX_SYMBOL_LIMIT: u32 = 500;
 
-/// Default and maximum result count for the doc-comment grep tool.
+/// Default and maximum result count for the doc-comment search tool.
 /// Lower than the symbol-search cap because each hit ships a ~200-char
 /// snippet — the per-item payload is roughly 3x larger.
-const DEFAULT_GREP_LIMIT: u32 = 20;
-const MAX_GREP_LIMIT: u32 = 100;
+const DEFAULT_DOC_SEARCH_LIMIT: u32 = 20;
+const MAX_DOC_SEARCH_LIMIT: u32 = 100;
 
-/// Cap on the grep query string. Generous enough for a short phrase
-/// ("zero-copy deserialization") but bounded so a runaway tool input
-/// can't force us to scan a kilobyte pattern across thousands of
-/// doc-comment bodies.
-const MAX_GREP_QUERY_LEN: usize = 256;
+/// Cap on the doc-comment search query string. Generous enough for a
+/// short phrase ("zero-copy deserialization") but bounded so a runaway
+/// tool input can't force us to scan a kilobyte pattern across
+/// thousands of doc-comment bodies.
+const MAX_DOC_SEARCH_QUERY_LEN: usize = 256;
 
 /// Target length, in chars, of the snippet returned per doc-comment
 /// hit. Roughly two sentences either side of the match.
@@ -196,19 +196,19 @@ impl DocsRsUseCase {
     /// item-name-match bonus, then hit count, then qualified name.
     ///
     /// Unlike [`Self::search_crate_symbols`] this requires a
-    /// non-empty query — "grep with no pattern" would return every
+    /// non-empty query — an empty pattern would return every
     /// documented item in the crate, which is not useful.
     #[tracing::instrument(skip(self))]
-    pub async fn grep_crate_docs(
+    pub async fn search_crate_docs(
         &self,
-        input: GrepCrateDocsUseCaseInput,
-    ) -> Result<GrepCrateDocsUseCaseOutput, DocsRsUseCaseError> {
+        input: SearchCrateDocsUseCaseInput,
+    ) -> Result<SearchCrateDocsUseCaseOutput, DocsRsUseCaseError> {
         let crate_name = validate_crate_name(input.crate_name.trim())?;
         let version = match input.version.as_deref().map(str::trim) {
             None | Some("") => DEFAULT_VERSION.to_string(),
             Some(v) => validate_version(v)?,
         };
-        let query = validate_grep_query(input.query.trim())?;
+        let query = validate_doc_search_query(input.query.trim())?;
         let kinds: Option<Vec<String>> = input
             .kinds
             .map(|ks| {
@@ -220,8 +220,8 @@ impl DocsRsUseCase {
             .filter(|ks: &Vec<String>| !ks.is_empty());
         let limit = input
             .limit
-            .unwrap_or(DEFAULT_GREP_LIMIT)
-            .clamp(1, MAX_GREP_LIMIT) as usize;
+            .unwrap_or(DEFAULT_DOC_SEARCH_LIMIT)
+            .clamp(1, MAX_DOC_SEARCH_LIMIT) as usize;
 
         let url = build_rustdoc_json_url(&self.base_url, &crate_name, &version);
 
@@ -310,7 +310,7 @@ impl DocsRsUseCase {
             })
             .collect();
 
-        Ok(GrepCrateDocsUseCaseOutput {
+        Ok(SearchCrateDocsUseCaseOutput {
             crate_name,
             resolved_version,
             total_matched,
@@ -474,15 +474,15 @@ fn parse_rustdoc_json_version(base_url: &str, crate_name: &str, final_url: &str)
     accept_version_segment(version)
 }
 
-fn validate_grep_query(query: &str) -> Result<String, DocsRsUseCaseError> {
+fn validate_doc_search_query(query: &str) -> Result<String, DocsRsUseCaseError> {
     if query.is_empty() {
         return Err(DocsRsUseCaseError::InvalidInput(
-            "query must not be empty (grep needs a pattern)".into(),
+            "query must not be empty (doc search needs a pattern)".into(),
         ));
     }
-    if query.len() > MAX_GREP_QUERY_LEN {
+    if query.len() > MAX_DOC_SEARCH_QUERY_LEN {
         return Err(DocsRsUseCaseError::InvalidInput(format!(
-            "query longer than {MAX_GREP_QUERY_LEN} characters"
+            "query longer than {MAX_DOC_SEARCH_QUERY_LEN} characters"
         )));
     }
     if query.chars().any(|c| c.is_control()) {
@@ -498,7 +498,7 @@ fn validate_grep_query(query: &str) -> Result<String, DocsRsUseCaseError> {
 ///
 /// Returns `None` for kinds that don't have a dedicated page (impls,
 /// fields, variants, use-statements, etc.) or kinds we don't model.
-/// Filtering on `None` keeps the grep results to items the caller can
+/// Filtering on `None` keeps the search results to items the caller can
 /// actually open with `get_crate_docs`.
 fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String, String)> {
     use rustdoc_types::ItemKind;
@@ -510,7 +510,7 @@ fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String
     if parents.is_empty() {
         // The summary refers to the crate root itself; it's the same
         // page as `get_crate_docs` with no `path` argument, so callers
-        // don't gain anything from a grep hit here. Skip.
+        // don't gain anything from a search hit here. Skip.
         return None;
     }
     let last = parents.last().copied()?;
@@ -566,7 +566,7 @@ fn qualified_name_from_summary(summary: &rustdoc_types::ItemSummary) -> String {
 
 /// Count non-overlapping occurrences of `needle` in `haystack`. Both
 /// sides are expected to be already-lowercased when called from
-/// `grep_crate_docs`; this function is byte-substring based and so
+/// `search_crate_docs`; this function is byte-substring based and so
 /// behaves the same on any input where caller lowercasing is
 /// consistent.
 fn count_substr(haystack: &str, needle: &str) -> usize {
@@ -1612,10 +1612,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_grep_query_rejects_empty_and_overlong() {
-        assert!(validate_grep_query("").is_err());
-        assert!(validate_grep_query(&"x".repeat(MAX_GREP_QUERY_LEN + 1)).is_err());
-        assert!(validate_grep_query("pin").is_ok());
+    fn validate_doc_search_query_rejects_empty_and_overlong() {
+        assert!(validate_doc_search_query("").is_err());
+        assert!(validate_doc_search_query(&"x".repeat(MAX_DOC_SEARCH_QUERY_LEN + 1)).is_err());
+        assert!(validate_doc_search_query("pin").is_ok());
     }
 
     #[test]
@@ -1706,7 +1706,7 @@ mod tests {
         // (e.g. `#[no_mangle]`, `#[repr]`); rustdoc emits an
         // `attr.{name}.html` page for it, the same shape as `ProcAttribute`.
         // Currently this kind falls through to the catch-all `_ => None`,
-        // so built-in attribute items are silently dropped from grep
+        // so built-in attribute items are silently dropped from search
         // results even though they're addressable pages.
         let summary = rustdoc_types::ItemSummary {
             crate_id: 0,
@@ -1807,11 +1807,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_rejects_empty_query() {
+    async fn search_crate_docs_rejects_empty_query() {
         let stub = Arc::new(DocsRsRepositoryStub::new());
         let use_case = use_case_with(stub);
         let err = use_case
-            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
                 crate_name: "anyhow".into(),
                 version: None,
                 query: "   ".into(),
@@ -1824,14 +1824,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_targets_crate_json_endpoint() {
+    async fn search_crate_docs_targets_crate_json_endpoint() {
         let stub = Arc::new(DocsRsRepositoryStub::new());
         let use_case = use_case_with(stub.clone());
         // No JSON enqueued; stub returns NotFound for us. We only care
         // here that the URL the use case built was the rustdoc-JSON
         // endpoint, not the lib-name path.
         let _ = use_case
-            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
                 crate_name: "tokio-util".into(),
                 version: Some("0.7.10".into()),
                 query: "pin".into(),
@@ -1847,14 +1847,14 @@ mod tests {
 
     /// End-to-end use-case test against the real anyhow rustdoc-JSON
     /// fixture (decompressed in-process via ruzstd). Complements the
-    /// transport-level test in `tests/grep_crate_docs.rs` by exercising
+    /// transport-level test in `tests/search_crate_docs.rs` by exercising
     /// ranking, snippet generation, and the kind filter without
     /// spinning up an MCP server or wiremock.
     #[tokio::test]
-    async fn grep_against_anyhow_fixture_returns_ranked_hits() -> anyhow::Result<()> {
+    async fn search_crate_docs_against_anyhow_fixture_returns_ranked_hits() -> anyhow::Result<()> {
         use std::io::Read;
         // Path is relative to this file. The integration test in
-        // `tests/grep_crate_docs.rs` uses the same fixture via a
+        // `tests/search_crate_docs.rs` uses the same fixture via a
         // shorter relative path.
         const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/anyhow_rustdoc.json.zst");
         let mut decoder = ruzstd::decoding::StreamingDecoder::new(FIXTURE)?;
@@ -1872,7 +1872,7 @@ mod tests {
         let use_case = use_case_with(stub);
 
         let out = use_case
-            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
                 crate_name: "anyhow".into(),
                 version: None,
                 query: "error".into(),

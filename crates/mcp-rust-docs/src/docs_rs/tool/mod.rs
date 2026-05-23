@@ -6,9 +6,9 @@ pub mod request;
 pub mod response;
 
 pub use self::error::DocsRsToolError;
-pub use self::request::{GetCrateDocsRequest, GrepCrateDocsRequest, SearchCrateSymbolsRequest};
+pub use self::request::{GetCrateDocsRequest, SearchCrateDocsRequest, SearchCrateSymbolsRequest};
 pub use self::response::{
-    DocHitDto, GetCrateDocsResponse, GrepCrateDocsResponse, SearchCrateSymbolsResponse, SymbolDto,
+    DocHitDto, GetCrateDocsResponse, SearchCrateDocsResponse, SearchCrateSymbolsResponse, SymbolDto,
 };
 
 use rmcp::{
@@ -85,7 +85,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Full-text grep over a Rust crate's doc-comments. Fetches the crate's rustdoc JSON from docs.rs and returns every documented item whose doc-comment body contains `query` (case-insensitive substring). Each hit carries the item's kind, qualified name, ~200-char snippet, and the `path` argument that `get_crate_docs` accepts. Unlike `search_crate_symbols` (which matches item names only), this searches the body text of the docs. Use when looking for usage notes, concepts, or examples that aren't visible in symbol names — e.g. \"zero-copy\", \"Pin\", \"thread-safe\". `query` is required and non-empty. `kinds` filters as in search_crate_symbols. `limit` defaults to 20, max 100.",
+        description = "Full-text search across a Rust crate's doc-comments. Fetches the crate's rustdoc JSON from docs.rs and returns every documented item whose doc-comment body contains `query` (case-insensitive substring). Each hit carries the item's kind, qualified name, ~200-char snippet, and the `path` argument that `get_crate_docs` accepts. Unlike `search_crate_symbols` (which matches item names only), this searches the body text of the docs. Use when looking for usage notes, concepts, or examples that aren't visible in symbol names — e.g. \"zero-copy\", \"Pin\", \"thread-safe\". `query` is required and non-empty. `kinds` filters as in search_crate_symbols. `limit` defaults to 20, max 100.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -93,16 +93,16 @@ impl Server {
             open_world_hint = true
         )
     )]
-    pub(crate) async fn grep_crate_docs(
+    pub(crate) async fn search_crate_docs(
         &self,
-        Parameters(args): Parameters<GrepCrateDocsRequest>,
+        Parameters(args): Parameters<SearchCrateDocsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let output = match self.docs_rs_use_case().grep_crate_docs(args.into()).await {
+        let output = match self.docs_rs_use_case().search_crate_docs(args.into()).await {
             Ok(output) => output,
             Err(err) => return Ok(DocsRsToolError::from(err).into_tool_result()),
         };
 
-        let response = GrepCrateDocsResponse::from(output);
+        let response = SearchCrateDocsResponse::from(output);
 
         match serde_json::to_string_pretty(&response) {
             Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),

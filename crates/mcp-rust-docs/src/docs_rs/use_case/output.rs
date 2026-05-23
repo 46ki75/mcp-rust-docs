@@ -58,14 +58,14 @@ pub struct SymbolEntry {
     pub path: String,
 }
 
-/// Result returned by the doc-comment grep use case.
+/// Result returned by the doc-comment search use case.
 ///
 /// Same shape as [`SearchCrateSymbolsUseCaseOutput`] so models that
 /// know one tool's response can read the other's without re-learning.
 /// `total_matched` is the pre-truncation count so the caller can tell
 /// when to narrow the query.
 #[derive(Debug, Clone)]
-pub struct GrepCrateDocsUseCaseOutput {
+pub struct SearchCrateDocsUseCaseOutput {
     /// Crate name as requested (post-normalisation).
     pub crate_name: String,
     /// Concrete version docs.rs served the JSON from, parsed out of
@@ -81,7 +81,7 @@ pub struct GrepCrateDocsUseCaseOutput {
     pub items: Vec<DocHit>,
 }
 
-/// One doc-comment match returned by the grep use case.
+/// One doc-comment match returned by the doc-comment search use case.
 #[derive(Debug, Clone)]
 pub struct DocHit {
     /// Normalised rustdoc kind (`struct`, `enum`, `trait`, `fn`,

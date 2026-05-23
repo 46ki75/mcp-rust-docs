@@ -7,7 +7,7 @@
 //!   and returns it as Markdown.
 //! - `search_crate_symbols` — lists public items in a crate by name,
 //!   handing back paths that `get_crate_docs` accepts.
-//! - `grep_crate_docs` — full-text searches a crate's doc-comments
+//! - `search_crate_docs` — full-text searches a crate's doc-comments
 //!   (sourced from docs.rs's rustdoc JSON), returning items whose
 //!   docs contain the query plus a snippet.
 //!
@@ -112,10 +112,10 @@ impl ServerHandler for Server {
         info.instructions = Some(
             "Rust ecosystem tools. `search_crates` queries the crates.io \
              registry; `search_crate_symbols` lists a crate's public items \
-             by name; `grep_crate_docs` full-text-searches a crate's \
+             by name; `search_crate_docs` full-text-searches a crate's \
              doc-comments via the rustdoc JSON; `get_crate_docs` fetches a \
              page from docs.rs and returns it as Markdown. Typical flow: \
-             search_crates → search_crate_symbols / grep_crate_docs → \
+             search_crates → search_crate_symbols / search_crate_docs → \
              get_crate_docs."
                 .to_string(),
         );

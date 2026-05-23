@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::docs_rs::use_case::{
-    DocHit, FetchCrateDocsUseCaseOutput, GrepCrateDocsUseCaseOutput,
+    DocHit, FetchCrateDocsUseCaseOutput, SearchCrateDocsUseCaseOutput,
     SearchCrateSymbolsUseCaseOutput, SymbolEntry,
 };
 
@@ -98,11 +98,11 @@ impl From<SymbolEntry> for SymbolDto {
     }
 }
 
-/// JSON body returned by the `grep_crate_docs` tool. Mirrors
+/// JSON body returned by the `search_crate_docs` tool. Mirrors
 /// [`SearchCrateSymbolsResponse`] shape with an extra `snippet` on
 /// each hit.
 #[derive(Debug, Serialize)]
-pub struct GrepCrateDocsResponse {
+pub struct SearchCrateDocsResponse {
     /// Crate name as requested.
     pub crate_name: String,
 
@@ -137,8 +137,8 @@ pub struct DocHitDto {
     pub snippet: String,
 }
 
-impl From<GrepCrateDocsUseCaseOutput> for GrepCrateDocsResponse {
-    fn from(output: GrepCrateDocsUseCaseOutput) -> Self {
+impl From<SearchCrateDocsUseCaseOutput> for SearchCrateDocsResponse {
+    fn from(output: SearchCrateDocsUseCaseOutput) -> Self {
         Self {
             crate_name: output.crate_name,
             resolved_version: output.resolved_version,

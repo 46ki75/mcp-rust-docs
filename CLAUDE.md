@@ -10,7 +10,7 @@ An MCP (Model Context Protocol) server written in Rust on top of the
 - `search_crates` — crates.io registry search.
 - `get_crate_docs` — docs.rs HTML → Markdown for one page.
 - `search_crate_symbols` — name-based symbol index from rustdoc `all.html`.
-- `grep_crate_docs` — full-text grep over doc comments via docs.rs's
+- `search_crate_docs` — full-text search over doc comments via docs.rs's
   zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json.zst`).
 
 The crate ships as a single binary, `mcp-rust-docs`, with two transport
@@ -103,7 +103,7 @@ a second tool module.
 | Tool                                     | URL shape                                                                                                            | Repository method    |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------- |
 | `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                      | `fetch_crate_docs`   |
-| `grep_crate_docs`                        | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
+| `search_crate_docs`                      | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
 
 The leading `/crate/` segment and the absence of the lib-name path are
 the easy-to-miss differences. `build_url` (HTML) and
@@ -124,7 +124,7 @@ When refreshing the test fixture
 the latest from `https://docs.rs/crate/anyhow/latest/json.zst` after
 bumping `rustdoc-types` — both the inline unit test (in
 `src/docs_rs/use_case/mod.rs`) and the integration test
-(`tests/grep_crate_docs.rs`) share the same file via different relative
+(`tests/search_crate_docs.rs`) share the same file via different relative
 paths, so the path itself must stay stable.
 
 ### `ruzstd` (pure Rust), not `zstd` (libzstd C binding)

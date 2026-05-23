@@ -56,12 +56,12 @@ pub struct SearchCrateSymbolsUseCaseInput {
 /// Pre-validation arguments for the doc-comment full-text search.
 ///
 /// Unlike [`SearchCrateSymbolsUseCaseInput`], `query` is required and
-/// non-empty: a "grep" with no pattern would return every item with a
+/// non-empty: an empty search pattern would return every item with a
 /// doc comment. The match runs case-insensitively against each item's
 /// rustdoc-JSON `docs` field — i.e. the raw doc comment Markdown, with
 /// intra-doc links and code fences intact.
 #[derive(Debug, Clone)]
-pub struct GrepCrateDocsUseCaseInput {
+pub struct SearchCrateDocsUseCaseInput {
     /// Crate name. Same normalisation as
     /// [`FetchCrateDocsUseCaseInput::crate_name`].
     pub crate_name: String,

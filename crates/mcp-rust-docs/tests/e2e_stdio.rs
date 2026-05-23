@@ -95,8 +95,8 @@ async fn stdio_child_lists_search_crates_tool() -> anyhow::Result<()> {
         "search_crate_symbols not advertised by stdio child: {names:?}",
     );
     assert!(
-        names.contains(&"grep_crate_docs"),
-        "grep_crate_docs not advertised by stdio child: {names:?}",
+        names.contains(&"search_crate_docs"),
+        "search_crate_docs not advertised by stdio child: {names:?}",
     );
 
     client.cancel().await?;

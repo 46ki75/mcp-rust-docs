@@ -215,13 +215,13 @@ async fn live_search_crate_symbols_finds_serde_deserialize_trait() -> anyhow::Re
 
 #[tokio::test]
 #[ignore = "live: hits real docs.rs"]
-async fn live_grep_crate_docs_finds_anyhow_error_mentions() -> anyhow::Result<()> {
+async fn live_search_crate_docs_finds_anyhow_error_mentions() -> anyhow::Result<()> {
     let server = Server::new()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "anyhow",
                 "query": "error",
                 "limit": 5,

@@ -1,4 +1,4 @@
-//! Hermetic integration tests for the `grep_crate_docs` tool.
+//! Hermetic integration tests for the `search_crate_docs` tool.
 //!
 //! Drives the server via `tokio::io::duplex` and serves a real (but
 //! version-pinned) anyhow rustdoc JSON fixture, zstd-compressed,
@@ -50,15 +50,15 @@ fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
 }
 
 #[tokio::test]
-async fn list_tools_advertises_grep_crate_docs() -> anyhow::Result<()> {
+async fn list_tools_advertises_search_crate_docs() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let tools = client.list_all_tools().await?;
     assert!(
-        tools.iter().any(|t| t.name == "grep_crate_docs"),
-        "grep_crate_docs not advertised: {tools:?}",
+        tools.iter().any(|t| t.name == "search_crate_docs"),
+        "search_crate_docs not advertised: {tools:?}",
     );
 
     client.cancel().await?;
@@ -67,7 +67,7 @@ async fn list_tools_advertises_grep_crate_docs() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn grep_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
+async fn search_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/crate/anyhow/latest/json.zst"))
@@ -86,7 +86,7 @@ async fn grep_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
     // but the doc-comment walk has stopped picking up trait/struct docs.
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "anyhow",
                 "query": "error",
                 "limit": 5,
@@ -139,7 +139,7 @@ async fn grep_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn grep_crate_docs_filters_by_kind() -> anyhow::Result<()> {
+async fn search_crate_docs_filters_by_kind() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/crate/anyhow/latest/json.zst"))
@@ -155,7 +155,7 @@ async fn grep_crate_docs_filters_by_kind() -> anyhow::Result<()> {
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "anyhow",
                 "query": "error",
                 "kinds": ["macro"],
@@ -185,7 +185,7 @@ async fn grep_crate_docs_filters_by_kind() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn grep_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow::Result<()> {
+async fn search_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     // No mock mount — an empty query should be rejected before any
     // HTTP call. If we accidentally hit the upstream, wiremock will
@@ -195,7 +195,7 @@ async fn grep_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow::R
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "anyhow",
                 "query": "   ",
             }))),
@@ -220,7 +220,7 @@ async fn grep_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow::R
 }
 
 #[tokio::test]
-async fn grep_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
+async fn search_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/crate/nonexistent/latest/json.zst"))
@@ -234,7 +234,7 @@ async fn grep_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "nonexistent",
                 "query": "pin",
             }))),
@@ -259,7 +259,7 @@ async fn grep_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn grep_crate_docs_reports_format_version_mismatch() -> anyhow::Result<()> {
+async fn search_crate_docs_reports_format_version_mismatch() -> anyhow::Result<()> {
     // Take the real anyhow fixture, decompress it, swap only
     // `format_version` to a value the repo cannot understand, then
     // recompress. This way every other field is still valid rustdoc
@@ -280,7 +280,7 @@ async fn grep_crate_docs_reports_format_version_mismatch() -> anyhow::Result<()>
 
     let result = client
         .call_tool(
-            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
                 "crate_name": "anyhow",
                 "query": "pin",
             }))),

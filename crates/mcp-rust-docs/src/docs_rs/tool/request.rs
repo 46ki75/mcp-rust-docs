@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::docs_rs::use_case::{
-    FetchCrateDocsUseCaseInput, GrepCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
+    FetchCrateDocsUseCaseInput, SearchCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
 };
 
 /// Arguments for the `get_crate_docs` tool.
@@ -88,7 +88,7 @@ impl From<SearchCrateSymbolsRequest> for SearchCrateSymbolsUseCaseInput {
     }
 }
 
-/// Arguments for the `grep_crate_docs` tool.
+/// Arguments for the `search_crate_docs` tool.
 ///
 /// `query` is matched as a case-insensitive substring against each
 /// item's doc-comment body (the raw Markdown rustdoc emits — intra-doc
@@ -96,7 +96,7 @@ impl From<SearchCrateSymbolsRequest> for SearchCrateSymbolsUseCaseInput {
 /// `path`, which can be passed straight through as `get_crate_docs.path`
 /// to read the full doc page.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepCrateDocsRequest {
+pub struct SearchCrateDocsRequest {
     /// Crate name as published on crates.io.
     pub crate_name: String,
 
@@ -124,8 +124,8 @@ pub struct GrepCrateDocsRequest {
     pub limit: Option<u32>,
 }
 
-impl From<GrepCrateDocsRequest> for GrepCrateDocsUseCaseInput {
-    fn from(request: GrepCrateDocsRequest) -> Self {
+impl From<SearchCrateDocsRequest> for SearchCrateDocsUseCaseInput {
+    fn from(request: SearchCrateDocsRequest) -> Self {
         Self {
             crate_name: request.crate_name,
             version: request.version,
