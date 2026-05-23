@@ -463,7 +463,18 @@ mod tests {
                 .await
         });
 
-        let (res_a, res_b) = tokio::join!(task_a, task_b);
+        // Bounded so a singleflight regression fails fast with a clear
+        // diagnostic instead of deadlocking on `Barrier(2)` and hanging
+        // CI until the job-level timeout fires. 5s is generous — the
+        // responder is a sync no-op once both tasks arrive.
+        let (res_a, res_b) = tokio::time::timeout(
+            Duration::from_secs(5),
+            async { tokio::join!(task_a, task_b) },
+        )
+        .await
+        .expect(
+            "test deadlocked — likely singleflight was introduced and only one task reached the barrier",
+        );
         res_a
             .expect("task A panicked")
             .expect("task A fetch failed");

@@ -193,6 +193,13 @@ fn decompress_zstd_bounded(compressed: &[u8], url: &str) -> Result<Vec<u8>, Docs
 /// In-memory stub used by unit tests across the crate. Gated on
 /// `cfg(test)` so it never ships in release builds and is invisible
 /// to integration tests in `tests/`.
+///
+/// Uses `Mutex<Vec<...>>` (not the `Fn` pattern from `CountingRepo`
+/// in `cache.rs`) because its responses are queue-based — `pop()` is
+/// an `FnMut` operation, and the mutex is what makes that sound under
+/// the shared `&self` repository trait. The two stubs serve different
+/// test shapes: this one consumes pre-enqueued results, `CountingRepo`
+/// invokes a single closure repeatedly. Don't "harmonize" them.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct DocsRsRepositoryStub {
