@@ -229,10 +229,10 @@ impl DocsRsUseCase {
         // a given crate at whatever format version it was last built
         // against, which varies across the ecosystem (popular crates
         // are usually current, but lagging ones may be a format
-        // behind). A 404 on the preferred version is the routine case
-        // for those lagging crates; any other repository error is
-        // terminal and short-circuits the chain. All-404 across the
-        // chain becomes `FormatVersionUnavailable`.
+        // behind). 404s and transient upstream errors (5xx/429, network
+        // hiccups) on the preferred version keep the chain walking;
+        // deterministic payload errors short-circuit. See
+        // `fetch_rustdoc_with_fallback` for the full policy.
         let FetchRustdocJsonRepositoryOutput {
             final_url,
             crate_json,
@@ -336,16 +336,30 @@ impl DocsRsUseCase {
     }
 
     /// Walk the supported-format list, fetching each URL until one
-    /// succeeds. `NotFound` is the only error we treat as a fallback
-    /// trigger; every other repository error short-circuits because it
-    /// indicates a real problem (network failure, malformed payload,
-    /// upstream 5xx) that retrying at a different format wouldn't fix.
+    /// succeeds. Continues past *fallback-eligible* errors — 404s
+    /// (the routine "this format isn't built" case) plus transient
+    /// upstream failures (5xx, 429, reqwest-level network errors) —
+    /// since the next format might still respond. Other repository
+    /// errors short-circuit because they describe a payload-level
+    /// problem that won't fix itself at a different format
+    /// (decompression failure, malformed JSON, unknown
+    /// `format_version`).
+    ///
+    /// Exhaustion policy: if every attempt was `NotFound`, surface
+    /// [`DocsRsUseCaseError::FormatVersionUnavailable`] — the crate
+    /// has no build at any format this tool understands, and the user
+    /// needs to know the gap is structural. If any attempt failed
+    /// transiently, surface the last error as
+    /// [`DocsRsUseCaseError::Repository`] so the user sees the
+    /// underlying "HTTP 503" or similar and can retry, rather than
+    /// being misdirected to a non-existent rustdoc-tooling problem.
     async fn fetch_rustdoc_with_fallback(
         &self,
         crate_name: &str,
         version: &str,
     ) -> Result<FetchRustdocJsonRepositoryOutput, DocsRsUseCaseError> {
-        let mut last_not_found: Option<DocsRsRepositoryError> = None;
+        let mut all_not_found = true;
+        let mut last_eligible_err: Option<DocsRsRepositoryError> = None;
         for &fv in SUPPORTED_FORMAT_VERSIONS {
             let url = build_rustdoc_json_url(&self.base_url, crate_name, version, fv);
             match self
@@ -354,28 +368,51 @@ impl DocsRsUseCase {
                 .await
             {
                 Ok(output) => return Ok(output),
-                Err(DocsRsRepositoryError::NotFound { url }) => {
-                    last_not_found = Some(DocsRsRepositoryError::NotFound { url });
-                    continue;
+                Err(err) if is_fallback_eligible(&err) => {
+                    if !matches!(err, DocsRsRepositoryError::NotFound { .. }) {
+                        all_not_found = false;
+                    }
+                    last_eligible_err = Some(err);
                 }
                 Err(other) => return Err(DocsRsUseCaseError::Repository(other)),
             }
         }
-        // Defensive: SUPPORTED_FORMAT_VERSIONS is non-empty at build
-        // time, so `last_not_found` must be `Some` here. Fall back to
-        // a generic NotFound on the (impossible) empty case so the
-        // type-checker stays happy without an `unreachable!`.
-        if last_not_found.is_some() {
+        if all_not_found {
             Err(DocsRsUseCaseError::FormatVersionUnavailable {
                 crate_name: crate_name.to_string(),
                 tried: SUPPORTED_FORMAT_VERSIONS.to_vec(),
             })
         } else {
-            Err(DocsRsUseCaseError::FormatVersionUnavailable {
-                crate_name: crate_name.to_string(),
-                tried: Vec::new(),
-            })
+            Err(DocsRsUseCaseError::Repository(last_eligible_err.expect(
+                "non-NotFound branch always records last_eligible_err",
+            )))
         }
+    }
+}
+
+/// Should this repository error let `fetch_rustdoc_with_fallback` try
+/// the next format version, or terminate immediately?
+///
+/// `true` for the cases where another attempt could succeed: 404s
+/// (the format simply isn't built for this crate), 5xx/429 (upstream
+/// blip), and reqwest-level network errors (DNS, TLS, connection
+/// reset — usually transient).
+///
+/// `false` for cases where retrying at a different format wouldn't
+/// fix anything: a malformed payload is malformed at any URL, and
+/// `FormatVersionUnsupported` already proves the payload was
+/// successfully fetched and parsed enough to read its self-declared
+/// version.
+fn is_fallback_eligible(err: &DocsRsRepositoryError) -> bool {
+    match err {
+        DocsRsRepositoryError::NotFound { .. } | DocsRsRepositoryError::Network(_) => true,
+        DocsRsRepositoryError::UpstreamStatus { status, .. } => {
+            status.is_server_error() || status.as_u16() == 429
+        }
+        DocsRsRepositoryError::PayloadTooLarge { .. }
+        | DocsRsRepositoryError::Decompression { .. }
+        | DocsRsRepositoryError::InvalidRustdocJson { .. }
+        | DocsRsRepositoryError::FormatVersionUnsupported { .. } => false,
     }
 }
 
@@ -1928,6 +1965,48 @@ mod tests {
             .map(|fv| format!("https://docs.rs/crate/tokio-util/0.7.10/json/{fv}.zst"))
             .collect();
         assert_eq!(stub.seen_urls().await, expected);
+    }
+
+    /// `FormatVersionUnsupported` is a deterministic payload-level
+    /// error — the bytes parsed enough to read `format_version`, but
+    /// no dispatch arm matched. The use case must propagate it
+    /// unchanged so the tool layer can render the version-skew message
+    /// (and so future refactors can't silently downgrade it to the
+    /// less informative `FormatVersionUnavailable`). The integration
+    /// test in `tests/search_crate_docs.rs` covers the full message
+    /// shape; this test guards the variant routing at the layer
+    /// boundary.
+    #[tokio::test]
+    async fn search_crate_docs_propagates_format_version_unsupported() {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue_json(Err(DocsRsRepositoryError::FormatVersionUnsupported {
+            url: "https://docs.rs/crate/anyhow/latest/json/57.zst".into(),
+            actual: 99_999_999,
+            supported: SUPPORTED_FORMAT_VERSIONS.to_vec(),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let err = use_case
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: None,
+                query: "error".into(),
+                kinds: None,
+                limit: None,
+            })
+            .await
+            .expect_err("FormatVersionUnsupported must propagate as Repository error");
+        assert!(
+            matches!(
+                err,
+                DocsRsUseCaseError::Repository(DocsRsRepositoryError::FormatVersionUnsupported {
+                    actual: 99_999_999,
+                    ..
+                })
+            ),
+            "expected FormatVersionUnsupported to propagate unchanged, got: {err:?}",
+        );
     }
 
     /// End-to-end use-case test against the real anyhow rustdoc-JSON

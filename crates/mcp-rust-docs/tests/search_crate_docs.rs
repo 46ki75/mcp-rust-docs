@@ -436,6 +436,190 @@ fn encode_zstd(data: &[u8]) -> Vec<u8> {
     compress_to_vec(data, CompressionLevel::Fastest)
 }
 
+/// Real-world failure mode: docs.rs's build pipeline or fronting CDN
+/// occasionally emits 5xx/429 mid-fetch. A transient error on the
+/// preferred format must NOT short-circuit the fallback chain — the
+/// older format might still be available. Without this, a brief
+/// docs.rs blip looks indistinguishable from "this crate has no
+/// rustdoc JSON anywhere," which is wrong and unhelpfully alarming.
+#[tokio::test]
+async fn search_crate_docs_falls_back_past_transient_upstream_error() -> anyhow::Result<()> {
+    const SERDE_JSON_ZST: &[u8] = include_bytes!("fixtures/serde_rustdoc.json.zst");
+
+    let mock = MockServer::start().await;
+    // Newer format errors transiently (503). The chain MUST keep walking.
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/57.zst"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream blip"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // Older format is healthy. Fallback should land here.
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/56.zst"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(SERDE_JSON_ZST.to_vec(), "application/zstd"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "deserialize",
+                "limit": 3,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "transient 5xx on the preferred format killed the fallback: {result:?}",
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    let total: u64 = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "fallback succeeded but returned no hits: {parsed}"
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Counterpart to the transient-error test: when every supported format
+/// fails transiently, the user must see the transient upstream error,
+/// NOT a "no compatible format build" message. Otherwise a docs.rs
+/// outage gets misdiagnosed as a permanent rustdoc-tooling gap.
+///
+/// Also pins the chain-walk: both URLs must be hit (otherwise we lose
+/// the "did the second format recover?" information).
+#[tokio::test]
+async fn search_crate_docs_propagates_upstream_error_when_all_formats_fail_transiently()
+-> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/57.zst"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream blip"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/crate/serde/latest/json/56.zst"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream blip"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "deserialize",
+            }))),
+        )
+        .await?;
+
+    assert_eq!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    // Must reflect the transient nature, not the "no compatible build"
+    // path. A 503 surfaced as `FormatVersionUnavailable` would tell the
+    // user the wrong thing (try a different version vs. try again later).
+    assert!(
+        text.contains("503"),
+        "expected HTTP 503 in error message, got: {text}",
+    );
+    assert!(
+        !text.contains("no rustdoc JSON"),
+        "all-transient must not be reported as no-build-available, got: {text}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Deterministic payload errors (zstd decompression failure, malformed
+/// JSON, unknown format_version) must short-circuit the chain. Retrying
+/// at a different format would waste an upstream round-trip on a
+/// problem that's already definitively reported. The `.expect(0)` on
+/// the second URL is what locks this in.
+#[tokio::test]
+async fn search_crate_docs_short_circuits_on_deterministic_payload_error() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    // Preferred URL returns garbage that isn't valid zstd. Repository
+    // surfaces `Decompression`, which is deterministic — trying the
+    // older format would just cost another round trip for nothing.
+    Mock::given(method("GET"))
+        .and(path("/crate/anyhow/latest/json/57.zst"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"not-actually-zstd".to_vec(), "application/zstd"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // If the fallback chain over-corrects and walks past deterministic
+    // errors too, this mount will record a hit and the expectation
+    // will fail at teardown.
+    Mock::given(method("GET"))
+        .and(path("/crate/anyhow/latest/json/56.zst"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"not-actually-zstd".to_vec(), "application/zstd"),
+        )
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "anyhow",
+                "query": "error",
+            }))),
+        )
+        .await?;
+
+    assert_eq!(result.is_error, Some(true));
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 /// End-to-end proof that the rustdoc-JSON cache short-circuits the
 /// second call. Uses `.expect(1)` on the wiremock mount: if the cache
 /// silently regresses to pass-through, the wiremock teardown would fail
