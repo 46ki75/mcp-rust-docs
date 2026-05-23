@@ -15,6 +15,14 @@ pub enum CratesIoUseCaseError {
     #[error("invalid request: {0}")]
     InvalidQuery(String),
 
+    /// The registry responded successfully but the payload is
+    /// internally inconsistent — e.g. `max_stable_version` names a
+    /// version that doesn't appear in the `versions[]` list. Surfaces
+    /// as "Upstream failure" at the tool boundary since retrying may
+    /// resolve it (stale mirror cache, mid-write GC race).
+    #[error("inconsistent upstream response: {0}")]
+    InconsistentUpstream(String),
+
     /// The repository call itself failed; see
     /// [`CratesIoRepositoryError`].
     #[error(transparent)]

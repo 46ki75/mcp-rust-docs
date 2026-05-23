@@ -358,8 +358,12 @@ impl DocsRsUseCase {
         crate_name: &str,
         version: &str,
     ) -> Result<FetchRustdocJsonRepositoryOutput, DocsRsUseCaseError> {
-        let mut all_not_found = true;
-        let mut last_eligible_err: Option<DocsRsRepositoryError> = None;
+        // Keep the FIRST transient (non-NotFound) error rather than
+        // overwriting on every iteration. A later `NotFound` is the
+        // expected outcome of probing the next format version and
+        // would mask the actionable signal (the 503 / 429 / network
+        // blip the caller could retry).
+        let mut first_transient_err: Option<DocsRsRepositoryError> = None;
         for &fv in SUPPORTED_FORMAT_VERSIONS {
             let url = build_rustdoc_json_url(&self.base_url, crate_name, version, fv);
             match self
@@ -369,23 +373,21 @@ impl DocsRsUseCase {
             {
                 Ok(output) => return Ok(output),
                 Err(err) if is_fallback_eligible(&err) => {
-                    if !matches!(err, DocsRsRepositoryError::NotFound { .. }) {
-                        all_not_found = false;
+                    if first_transient_err.is_none()
+                        && !matches!(err, DocsRsRepositoryError::NotFound { .. })
+                    {
+                        first_transient_err = Some(err);
                     }
-                    last_eligible_err = Some(err);
                 }
                 Err(other) => return Err(DocsRsUseCaseError::Repository(other)),
             }
         }
-        if all_not_found {
-            Err(DocsRsUseCaseError::FormatVersionUnavailable {
+        match first_transient_err {
+            Some(err) => Err(DocsRsUseCaseError::Repository(err)),
+            None => Err(DocsRsUseCaseError::FormatVersionUnavailable {
                 crate_name: crate_name.to_string(),
                 tried: SUPPORTED_FORMAT_VERSIONS.to_vec(),
-            })
-        } else {
-            Err(DocsRsUseCaseError::Repository(last_eligible_err.expect(
-                "non-NotFound branch always records last_eligible_err",
-            )))
+            }),
         }
     }
 }
@@ -2006,6 +2008,72 @@ mod tests {
                 })
             ),
             "expected FormatVersionUnsupported to propagate unchanged, got: {err:?}",
+        );
+    }
+
+    /// Bug reproduction (currently FAILS): when the fallback chain
+    /// encounters a transient upstream error followed by a `NotFound`
+    /// at a later format version, the use case loses the meaningful
+    /// error. `last_eligible_err` is overwritten on every iteration,
+    /// so the chain `[503@57, 404@56]` surfaces a misleading 404 at
+    /// format 56 instead of the actionable 503 the caller could retry.
+    ///
+    /// Expected behaviour: propagate the 503 (the most informative
+    /// non-NotFound error) so the user sees "Upstream failure: 503"
+    /// and knows to retry, rather than chasing a phantom missing
+    /// build.
+    ///
+    /// Stub queue is LIFO (`Vec::pop`), so the 503 must be enqueued
+    /// LAST to be returned first. The second iteration finds the queue
+    /// empty and the stub's default `NotFound` branch fires for the
+    /// remaining format version.
+    #[tokio::test]
+    async fn fetch_rustdoc_with_fallback_surfaces_transient_error_over_later_not_found() {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue_json(Err(DocsRsRepositoryError::UpstreamStatus {
+            url: format!(
+                "https://docs.rs/crate/anyhow/1.0.86/json/{}.zst",
+                SUPPORTED_FORMAT_VERSIONS[0],
+            ),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: "upstream blip".into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub.clone());
+
+        let err = use_case
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: Some("1.0.86".into()),
+                query: "error".into(),
+                kinds: None,
+                limit: None,
+            })
+            .await
+            .expect_err("expected propagated upstream error");
+
+        // Mixed-error walk must traverse the full chain (the 503
+        // alone keeps `all_not_found` false, so we don't collapse
+        // into FormatVersionUnavailable).
+        let urls = stub.seen_urls().await;
+        assert_eq!(
+            urls.len(),
+            SUPPORTED_FORMAT_VERSIONS.len(),
+            "expected full chain walk, saw: {urls:?}",
+        );
+
+        // The 503 must outrank the later NotFound. Under the bug this
+        // assertion fails: the propagated error is the 404 from the
+        // last format attempted.
+        assert!(
+            matches!(
+                err,
+                DocsRsUseCaseError::Repository(DocsRsRepositoryError::UpstreamStatus {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                })
+            ),
+            "expected the 503 to be propagated; got: {err:?}",
         );
     }
 

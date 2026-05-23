@@ -16,8 +16,9 @@ pub use self::output::{
 
 use crate::crates_io::repository::{
     CratesIoRepository, FetchCrateInput, FetchCrateRepositoryOutput,
-    FetchCrateVersionDependenciesInput, RepositoryCrateRecord, RepositoryDependency,
-    RepositoryDependencyKind, SearchCratesRepositoryInput, SearchCratesRepositoryOutput,
+    FetchCrateVersionDependenciesInput, RepositoryCrateRecord, RepositoryCrateVersion,
+    RepositoryDependency, RepositoryDependencyKind, SearchCratesRepositoryInput,
+    SearchCratesRepositoryOutput,
 };
 
 const DEFAULT_PER_PAGE: u8 = 10;
@@ -113,17 +114,14 @@ impl CratesIoUseCase {
             })
             .await?;
 
-        let resolved_version = resolve_metadata_version(&aggregate, input.version.as_deref())?;
-
-        // Find the resolved version entry so we can read its features
-        // and yanked status. Guaranteed Some because
-        // `resolve_metadata_version` only returns a string that came
-        // from this same versions list.
-        let resolved_entry = aggregate
-            .versions
-            .iter()
-            .find(|v| v.num == resolved_version)
-            .expect("resolved version is sourced from aggregate.versions");
+        // `resolve_metadata_version` returns a borrowed entry from
+        // `aggregate.versions[]` so the resolved version, its features,
+        // and its yanked flag all come from the same authoritative
+        // record — no second lookup, no panic if the registry served
+        // an inconsistent aggregate (max_stable_version not in the
+        // versions list).
+        let resolved_entry = resolve_metadata_version(&aggregate, input.version.as_deref())?;
+        let resolved_version = resolved_entry.num.clone();
         let features = resolved_entry.features.clone();
         let resolved_yanked = resolved_entry.yanked;
 
@@ -161,12 +159,19 @@ impl CratesIoUseCase {
     }
 }
 
-/// Apply the version-selection policy. Lives outside the impl for
+/// Apply the version-selection policy and return the matching
+/// [`RepositoryCrateVersion`] entry. Lives outside the impl for
 /// unit-testability without a use case fixture.
-fn resolve_metadata_version(
-    aggregate: &FetchCrateRepositoryOutput,
+///
+/// Returns a borrow so the caller can read the entry's features /
+/// yanked flag without a second lookup — which is also what makes the
+/// inconsistency case (max_stable_version names a version absent from
+/// the list) surface as `InconsistentUpstream` rather than panicking
+/// on a downstream `.expect()`.
+fn resolve_metadata_version<'a>(
+    aggregate: &'a FetchCrateRepositoryOutput,
     requested: Option<&str>,
-) -> Result<String, CratesIoUseCaseError> {
+) -> Result<&'a RepositoryCrateVersion, CratesIoUseCaseError> {
     let requested = requested.map(str::trim).filter(|s| !s.is_empty());
 
     let pick_latest = match requested {
@@ -174,22 +179,35 @@ fn resolve_metadata_version(
         Some(v) => v.eq_ignore_ascii_case(LATEST_VERSION),
     };
     if pick_latest {
-        return Ok(aggregate
+        let preferred = aggregate
             .max_stable_version
-            .clone()
-            .unwrap_or_else(|| aggregate.max_version.clone()));
+            .as_deref()
+            .unwrap_or(aggregate.max_version.as_str());
+        return aggregate
+            .versions
+            .iter()
+            .find(|v| v.num == preferred)
+            .ok_or_else(|| {
+                CratesIoUseCaseError::InconsistentUpstream(format!(
+                    "crate `{}` aggregate names latest version `{}` but it is \
+                     absent from the published versions list",
+                    aggregate.name, preferred,
+                ))
+            });
     }
 
     let asked = requested.expect("pick_latest=false implies Some");
-    if aggregate.versions.iter().any(|v| v.num == asked) {
-        Ok(asked.to_string())
-    } else {
-        Err(CratesIoUseCaseError::InvalidQuery(format!(
-            "version `{}` not found for crate `{}` (semver ranges not \
-             supported here — pass a concrete version like `1.40.0` or `latest`)",
-            asked, aggregate.name,
-        )))
-    }
+    aggregate
+        .versions
+        .iter()
+        .find(|v| v.num == asked)
+        .ok_or_else(|| {
+            CratesIoUseCaseError::InvalidQuery(format!(
+                "version `{}` not found for crate `{}` (semver ranges not \
+                 supported here — pass a concrete version like `1.40.0` or `latest`)",
+                asked, aggregate.name,
+            ))
+        })
 }
 
 /// Project the repository dependency list into the use-case summary
@@ -661,5 +679,51 @@ mod tests {
             .await
             .expect_err("expected InvalidQuery for blank crate name");
         assert!(matches!(err, CratesIoUseCaseError::InvalidQuery(_)));
+    }
+
+    /// When crates.io returns an aggregate whose `max_stable_version`
+    /// (or `max_version`) does not appear in `versions[]` — possible
+    /// with a stale registry mirror, a GC race, or a buggy compatible
+    /// registry — `resolve_metadata_version` must surface a clean
+    /// `InconsistentUpstream` error instead of panicking on a
+    /// downstream `.expect()`. Pinned via `tokio::spawn` so a panic
+    /// regression would surface as `JoinError`, not a clean failure.
+    #[tokio::test]
+    async fn metadata_returns_clean_error_when_aggregate_versions_omit_max_stable() {
+        let stub = Arc::new(CratesIoRepositoryStub::new());
+        let aggregate = FetchCrateRepositoryOutput {
+            name: "ghost".into(),
+            max_version: "1.0.0".into(),
+            max_stable_version: Some("1.0.0".into()),
+            // `1.0.0` is deliberately ABSENT from the versions list to
+            // simulate the inconsistent-aggregate scenario.
+            versions: vec![version_entry("0.9.0", false)],
+        };
+        stub.enqueue_crate(Ok(aggregate)).await;
+        let use_case = CratesIoUseCase::new(stub);
+
+        let join = tokio::spawn(async move {
+            use_case
+                .get_crate_metadata(GetCrateMetadataUseCaseInput {
+                    crate_name: "ghost".into(),
+                    version: None,
+                })
+                .await
+        })
+        .await;
+
+        let outcome =
+            join.expect("use case must not panic on inconsistent aggregate — return Err instead");
+        let err = outcome.expect_err(
+            "expected InconsistentUpstream when max_stable_version is missing from versions list",
+        );
+        assert!(
+            matches!(
+                err,
+                CratesIoUseCaseError::InconsistentUpstream(ref msg)
+                    if msg.contains("1.0.0") && msg.contains("ghost"),
+            ),
+            "unexpected error: {err:?}",
+        );
     }
 }
