@@ -1,0 +1,40 @@
+[package]
+name = "mcp-rust-docs"
+version = "1.0.0-alpha.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MCP server exposing Rust ecosystem tools (starting with crates.io search)."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+wiremock = { workspace = true }
+
+[[bin]]
+name = "mcp-rust-docs"
+path = "src/bin/main.rs"

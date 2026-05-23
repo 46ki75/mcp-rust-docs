@@ -1,0 +1,31 @@
+name: ci-live
+
+# Live tests hit the real crates.io API. Per the org standards, live-test
+# failures MUST NOT block PR merges — they fail for reasons unrelated to
+# the diff (network, rate limits, upstream schema changes). So this
+# workflow runs only on manual dispatch and on a weekly schedule.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays at 06:00 UTC — early enough that any breakage is visible
+    # at the start of the week.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ci-live-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: just ci-live
+        run: just ci-live
