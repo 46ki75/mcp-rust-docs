@@ -110,7 +110,14 @@ impl DocsRsUseCase {
             .await?;
 
         let resolved_version = parse_version_from_url(&self.base_url, &crate_name, &final_url);
-        let markdown = html_to_markdown(&html);
+        // `html2md::rewrite_html` is CPU-bound and runs in the tens of
+        // ms on a hundreds-of-KB docs.rs page — long enough to stall
+        // other in-flight requests on the HTTP transport if we ran it
+        // on the async worker. Same reasoning as
+        // `fetch_rustdoc_json` (see repository::fetch_rustdoc_json).
+        let markdown = tokio::task::spawn_blocking(move || html_to_markdown(&html))
+            .await
+            .expect("html_to_markdown panicked");
 
         Ok(FetchCrateDocsUseCaseOutput {
             crate_name,
@@ -464,11 +471,7 @@ fn parse_rustdoc_json_version(base_url: &str, crate_name: &str, final_url: &str)
     let prefix = format!("{}/crate/{crate_name}/", base_url.trim_end_matches('/'));
     let rest = final_url.strip_prefix(&prefix)?;
     let version = rest.split('/').next()?;
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
+    accept_version_segment(version)
 }
 
 fn validate_grep_query(query: &str) -> Result<String, DocsRsUseCaseError> {
@@ -775,25 +778,75 @@ fn parse_all_html(html: &str) -> Vec<SymbolEntry> {
     entries
 }
 
-/// Find `name="value"` in an HTML open-tag attribute span. Returns
-/// the value if present; otherwise `None`. Whitespace before the
-/// attribute is implied by the way we slice (the leading space of
-/// `<h3 id=...>` is consumed by the `<h3 ` split). The match also
-/// allows other characters preceding the attribute (e.g.
-/// `class="x" id="y"`) by searching for ` name="` first.
+/// Find `name="value"` (or `name='value'`, or unquoted `name=value`)
+/// in an HTML open-tag attribute span. Returns the value if present;
+/// otherwise `None`.
+///
+/// Walks the attribute string as a tokenizer rather than substring-
+/// searching, so a value that happens to contain the bytes ` name="`
+/// can't fool the parser into returning a slice from inside that value.
 fn find_attr<'a>(open_tag_attrs: &'a str, name: &str) -> Option<&'a str> {
-    // Try `name="` at the very start, then ` name="` anywhere else.
-    // This handles both `id="…"` (start of attrs) and `class="…" id="…"`.
-    let lead = format!("{name}=\"");
-    let mid = format!(" {name}=\"");
-    let start = if let Some(s) = open_tag_attrs.strip_prefix(&lead) {
-        s
-    } else {
-        let mid_pos = open_tag_attrs.find(mid.as_str())?;
-        &open_tag_attrs[mid_pos + mid.len()..]
-    };
-    let end = start.find('"')?;
-    Some(&start[..end])
+    let bytes = open_tag_attrs.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    loop {
+        // Skip whitespace between attributes.
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            return None;
+        }
+        // Read attribute name. HTML5 ends an attribute name at
+        // whitespace, `=`, `>`, or `/`.
+        let name_start = i;
+        while i < len
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+            && !bytes[i].is_ascii_whitespace()
+        {
+            i += 1;
+        }
+        let attr_name = &open_tag_attrs[name_start..i];
+        // Allow whitespace between name and `=`.
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b'=' {
+            // Valueless attribute (e.g. `disabled`). Skip and try next.
+            continue;
+        }
+        i += 1; // past `=`
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            return None;
+        }
+        let (value_start, value_end) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            let start = i;
+            while i < len && bytes[i] != quote {
+                i += 1;
+            }
+            let end = i;
+            if i < len {
+                i += 1; // past closing quote
+            }
+            (start, end)
+        } else {
+            let start = i;
+            while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+            (start, i)
+        };
+        if attr_name == name {
+            return Some(&open_tag_attrs[value_start..value_end]);
+        }
+    }
 }
 
 /// Strip HTML tags from a short fragment of inline content, leaving
@@ -846,31 +899,99 @@ fn parse_version_from_url(base_url: &str, crate_name: &str, final_url: &str) -> 
     let prefix = format!("{}/{crate_name}/", base_url.trim_end_matches('/'));
     let rest = final_url.strip_prefix(&prefix)?;
     let version = rest.split('/').next()?;
-    if version.is_empty() {
-        None
+    accept_version_segment(version)
+}
+
+/// Validate that a path segment captured as a "version" actually looks
+/// like one. Accepts the literal `latest` (only seen when docs.rs does
+/// not redirect — typically because the URL was hand-built without
+/// going through the resolver) or a semver-shaped string starting with
+/// a digit. Refuses anything else so a misconfigured mirror redirecting
+/// to `/{crate}/badge.svg` doesn't surface "badge.svg" as the resolved
+/// version.
+fn accept_version_segment(segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return None;
+    }
+    if segment == "latest" || segment.as_bytes()[0].is_ascii_digit() {
+        Some(segment.to_string())
     } else {
-        Some(version.to_string())
+        None
     }
 }
 
 /// Pull the rustdoc body content out of the surrounding chrome
 /// (sidebar, search box, footer). rustdoc emits exactly one `<main>`
-/// element per page wrapping the meaningful prose, so a simple
-/// substring slice is reliable enough and avoids pulling in a DOM
-/// parser. If the markers aren't found (mirror with a custom layout,
-/// an error page, or non-rustdoc HTML) we fall back to the full body
-/// so the caller still gets *something*.
+/// element per page wrapping the meaningful prose, so we hunt for it
+/// by walking the HTML — skipping over `<!-- ... -->` comments that
+/// may embed `<main>` as example text, and requiring a tag boundary
+/// after `<main` so we don't latch onto `<mainframe>` etc. If the
+/// markers aren't found (mirror with a custom layout, an error page,
+/// or non-rustdoc HTML) we fall back to the full body so the caller
+/// still gets *something*.
 fn extract_main_content(html: &str) -> &str {
-    let Some(open_idx) = html.find("<main") else {
+    let Some(open_idx) = find_main_open(html) else {
         return html;
     };
     let after_open = &html[open_idx..];
-    let Some(close_rel) = after_open.find("</main>") else {
+    let Some(close_rel) = find_main_close(after_open) else {
         return html;
     };
     // `</main>` is 7 chars; include it so the closing tag balances
     // and html2md doesn't see a half-open element.
     &after_open[..close_rel + "</main>".len()]
+}
+
+/// Walk `html` and return the byte index of the first `<main>` or
+/// `<main …>` opening tag that isn't inside an HTML comment. Returns
+/// `None` if no such tag exists.
+fn find_main_open(html: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip over `<!-- ... -->` comments so an example like
+        // `<!-- usage: <main>...</main> -->` doesn't fool us.
+        if bytes[i..].starts_with(b"<!--") {
+            let after = i + 4;
+            match html[after..].find("-->") {
+                Some(rel) => i = after + rel + 3,
+                None => return None,
+            }
+            continue;
+        }
+        // Require `<main` followed by a tag-boundary character so we
+        // skip `<mainframe>`, `<main2>`, etc.
+        if bytes[i..].starts_with(b"<main") {
+            let next = bytes.get(i + 5).copied();
+            if matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk `html` and return the byte index of the first `</main>` that
+/// isn't inside an HTML comment.
+fn find_main_close(html: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<!--") {
+            let after = i + 4;
+            match html[after..].find("-->") {
+                Some(rel) => i = after + rel + 3,
+                None => return None,
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"</main>") {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn html_to_markdown(html: &str) -> String {
@@ -1812,5 +1933,79 @@ mod tests {
         );
         assert_eq!(out.total_matched, 600);
         Ok(())
+    }
+
+    /// docs.rs's redirect from `/{crate}/latest/` always lands on a
+    /// URL whose first segment after the crate is a version (e.g.
+    /// `1.2.3`) or the literal `latest`. If for any reason the redirect
+    /// lands on a non-version segment — for instance, a path that
+    /// happens to point at `/{crate}/badge.svg` on a misconfigured
+    /// mirror — `parse_version_from_url` MUST refuse to call that
+    /// segment a "version" and return `None`. Today it happily returns
+    /// `Some("badge.svg")`, which would surface as a bogus
+    /// `resolved_version` to the caller.
+    #[test]
+    fn parse_version_from_url_rejects_non_version_segment() {
+        let v = parse_version_from_url(
+            "https://docs.rs",
+            "serde",
+            "https://docs.rs/serde/badge.svg",
+        );
+        assert_eq!(
+            v, None,
+            "non-version segment must not be reported as a version, got {v:?}",
+        );
+    }
+
+    /// `extract_main_content` MUST find the page's real `<main>`
+    /// element. An HTML comment earlier in the document that happens
+    /// to contain the literal substring `<main` (for instance, a
+    /// rustdoc-emitted example showing how to use `<main>` in an
+    /// `html!` macro snippet) MUST NOT be treated as the start of the
+    /// real main element. Today the substring search returns the
+    /// comment body and the caller gets the example text instead of
+    /// the actual page content.
+    #[test]
+    fn extract_main_content_skips_main_inside_html_comment() {
+        let html = "\
+<html><body>\
+<!-- example: <main>commented-out-content</main> -->\
+<nav>sidebar</nav>\
+<main><h1>real page content</h1></main>\
+</body></html>";
+        let got = extract_main_content(html);
+        assert!(
+            got.contains("real page content"),
+            "should extract the real <main>, got: {got:?}",
+        );
+        assert!(
+            !got.contains("commented-out-content"),
+            "must not return content from inside an HTML comment, got: {got:?}",
+        );
+    }
+
+    /// `find_attr` MUST only match attribute names at attribute
+    /// boundaries — not substrings inside other attributes' quoted
+    /// values. Rustdoc properly HTML-escapes today so this case isn't
+    /// reachable from upstream output, but the parser has no defense:
+    /// if an attribute value ever contains the literal characters
+    /// ` id="…"` (for instance, because we point at a non-rustdoc
+    /// fixture, a mirror with a custom layout, or rustdoc starts
+    /// embedding raw HTML examples in attributes), the naive
+    /// `str::find(" id=\"")` matches inside the value and returns the
+    /// wrong id. Locking this contract in now keeps the regression
+    /// surface small if rustdoc HTML drifts.
+    #[test]
+    fn find_attr_does_not_match_inside_quoted_attribute_value() {
+        // Adversarial input: the `class` value contains a literal `"`
+        // sequence that, when scanned as raw bytes, looks like another
+        // attribute with `id="fake"`. The real `id` attribute follows.
+        let attrs = "class=\" id=\"fake\"\" id=\"real\"";
+        let got = find_attr(attrs, "id");
+        assert_eq!(
+            got,
+            Some("real"),
+            "find_attr must match the real attribute, not a substring inside a quoted value",
+        );
     }
 }
