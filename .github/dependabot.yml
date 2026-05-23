@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Cargo dependencies for the entire workspace. Dependabot follows
+  # workspace inheritance, so PRs target the root Cargo.toml regardless
+  # of which member crate uses the dep.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      # Bundle minor + patch bumps into one PR per week to reduce noise.
+      # Major bumps still come as individual PRs so they get the
+      # attention they deserve.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Pin updates for GitHub Actions referenced in .github/workflows/.
+  # Without this, action versions silently rot.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
