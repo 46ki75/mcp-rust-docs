@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 pub use self::error::CratesIoRepositoryError;
 pub use self::input::SearchCratesRepositoryInput;
@@ -123,21 +122,28 @@ struct CratesIoMeta {
     total: u64,
 }
 
+/// In-memory stub used by unit tests across the crate. Gated on `cfg(test)`
+/// so it never ships in release builds and is invisible to integration
+/// tests in `tests/` — those should exercise the real repository through
+/// a `wiremock`-backed HTTP upstream.
+#[cfg(test)]
 #[derive(Default)]
-pub struct CratesIoRepositoryStub {
-    queue: Mutex<Vec<SearchCratesResult>>,
+pub(crate) struct CratesIoRepositoryStub {
+    queue: tokio::sync::Mutex<Vec<SearchCratesResult>>,
 }
 
+#[cfg(test)]
 impl CratesIoRepositoryStub {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub async fn enqueue(&self, result: SearchCratesResult) {
+    pub(crate) async fn enqueue(&self, result: SearchCratesResult) {
         self.queue.lock().await.push(result);
     }
 }
 
+#[cfg(test)]
 impl CratesIoRepository for CratesIoRepositoryStub {
     fn search_crates(
         &self,
