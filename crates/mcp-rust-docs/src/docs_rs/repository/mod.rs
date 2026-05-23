@@ -10,10 +10,7 @@ pub mod output;
 use std::io::Read;
 use std::sync::Arc;
 
-pub use self::cache::{
-    CachingDocsRsRepository, CachingDocsRsRepositoryConfig, DEFAULT_RUSTDOC_CACHE_CAPACITY,
-    DEFAULT_RUSTDOC_CACHE_TTL,
-};
+pub use self::cache::CachingDocsRsRepository;
 pub use self::error::DocsRsRepositoryError;
 pub use self::input::{FetchCrateDocsRepositoryInput, FetchRustdocJsonRepositoryInput};
 pub use self::output::{FetchCrateDocsRepositoryOutput, FetchRustdocJsonRepositoryOutput};

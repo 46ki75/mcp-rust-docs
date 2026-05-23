@@ -95,11 +95,14 @@ impl ServerBuilder {
     }
 
     /// Inject a fully-formed docs.rs repository. Same caveats as
-    /// [`crates_io_repository`](Self::crates_io_repository). When the
-    /// docs.rs cache is enabled (the default), the injected repository
-    /// is still wrapped — pass `false` to
-    /// [`docs_rs_cache_enabled`](Self::docs_rs_cache_enabled) for tests
-    /// that need exact upstream call counts.
+    /// [`crates_io_repository`](Self::crates_io_repository).
+    ///
+    /// **Caveat:** the injected repository is silently wrapped by the
+    /// rustdoc-JSON cache when [`docs_rs_cache_enabled`](Self::docs_rs_cache_enabled)
+    /// is `true` (the default). Tests that drive a stub or wiremock and
+    /// assert exact upstream call counts (e.g. `.expect(N)`) MUST pass
+    /// `false` to `docs_rs_cache_enabled` — otherwise repeat fetches
+    /// hit the cache instead of the stub and the assertions undercount.
     pub fn docs_rs_repository(mut self, repository: Arc<dyn DocsRsRepository>) -> Self {
         self.docs_rs_repository = Some(repository);
         self
