@@ -1,0 +1,8 @@
+ignores:
+  - "./LICENSE"
+  - "**/node_modules/**"
+  - "./.agents/**"
+  - "./.claude/**"
+  - "./notes/**"
+  - "./submodules/**"
+  - "./target/**"

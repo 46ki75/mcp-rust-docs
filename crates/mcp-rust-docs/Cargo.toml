@@ -1,0 +1,38 @@
+[package]
+name = "mcp-rust-docs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MCP server exposing Rust ecosystem tools (starting with crates.io search)."
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+wiremock = { workspace = true }
+
+[[bin]]
+name = "mcp-rust-docs-stdio"
+path = "src/bin/stdio.rs"
+
+[[bin]]
+name = "mcp-rust-docs-http"
+path = "src/bin/http.rs"
