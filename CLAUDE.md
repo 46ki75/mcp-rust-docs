@@ -100,10 +100,10 @@ a second tool module.
 
 ### docs.rs has two distinct endpoint families — don't confuse them
 
-| Tool | URL shape | Repository method |
-| ---- | --------- | ----------------- |
-| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name) | `fetch_crate_docs` |
-| `grep_crate_docs` | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
+| Tool                                     | URL shape                                                                                                            | Repository method    |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name)                                      | `fetch_crate_docs`   |
+| `grep_crate_docs`                        | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
 
 The leading `/crate/` segment and the absence of the lib-name path are
 the easy-to-miss differences. `build_url` (HTML) and
@@ -129,7 +129,7 @@ paths, so the path itself must stay stable.
 
 ### `ruzstd` (pure Rust), not `zstd` (libzstd C binding)
 
-Chosen deliberately: `ruzstd` 0.8+ has both decoder *and* encoder, so
+Chosen deliberately: `ruzstd` 0.8+ has both decoder _and_ encoder, so
 the format-version-mismatch test can recompress a mutated fixture
 without pulling in a C dep. Don't switch to the `zstd` crate without a
 concrete reason — the C binding adds a build-system surface for
