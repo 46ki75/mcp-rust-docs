@@ -1,4 +1,4 @@
-/// In-process LRU+TTL cache wrapping another [`DocsRsRepository`].
+/// In-process bounded TTL cache wrapping another [`DocsRsRepository`].
 pub mod cache;
 /// Per-error-variant docs for repository failures.
 pub mod error;

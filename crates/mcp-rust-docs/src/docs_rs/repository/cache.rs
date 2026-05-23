@@ -73,8 +73,9 @@ impl Default for CachingDocsRsRepositoryConfig {
     }
 }
 
-/// Decorator that adds an in-process LRU+TTL cache to
-/// `fetch_rustdoc_json`. `fetch_crate_docs` passes through unchanged.
+/// Decorator that adds an in-process bounded TTL cache (W-TinyLFU
+/// eviction, via `moka`) to `fetch_rustdoc_json`. `fetch_crate_docs`
+/// passes through unchanged.
 pub struct CachingDocsRsRepository {
     inner: Arc<dyn DocsRsRepository>,
     rustdoc_cache: Cache<String, Arc<FetchRustdocJsonRepositoryOutput>>,

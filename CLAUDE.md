@@ -150,8 +150,9 @@ will silently regress concurrency under load.**
 `CachingDocsRsRepository` (`docs_rs/repository/cache.rs`) is a
 decorator wrapped around the real repository by `ServerBuilder` by
 default. It caches successful `FetchRustdocJsonRepositoryOutput`
-values in an in-process LRU+TTL keyed by the requested URL string
-(default: 16 entries, 10-minute TTL, via `moka`). Rationale:
+values in an in-process bounded TTL cache keyed by the requested URL
+string (default: 16 entries, 10-minute TTL, via `moka` — W-TinyLFU
+eviction, not strict LRU). Rationale:
 `search_crate_docs` reliably hits the same `(crate, version)` JSON
 payload across multiple queries in a session, and the per-call cost
 (network + zstd + serde) dwarfs the substring walk. Errors are
