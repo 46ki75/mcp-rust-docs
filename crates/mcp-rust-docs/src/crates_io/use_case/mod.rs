@@ -92,19 +92,24 @@ impl CratesIoUseCase {
     ///   else `max_version`.
     /// - Some concrete semver string → must appear in the versions
     ///   list; otherwise `InvalidQuery` (typo or unpublished).
-    /// - Semver ranges (`^1.0`) are not supported and surface as
-    ///   `InvalidQuery`.
+    /// - Semver ranges (`^1`, `1.*`, etc.) → resolved to
+    ///   `max_stable_version` (best-effort), since the crates.io
+    ///   per-version endpoint only accepts concrete identifiers. The
+    ///   returned `resolved_version` reflects what metadata actually
+    ///   describes and may differ from the version docs.rs serves for
+    ///   the same range.
     #[tracing::instrument(skip(self))]
     pub async fn get_crate_metadata(
         &self,
         input: GetCrateMetadataUseCaseInput,
     ) -> Result<CrateMetadata, CratesIoUseCaseError> {
         let crate_name = input.crate_name.trim();
-        if crate_name.is_empty() {
-            return Err(CratesIoUseCaseError::InvalidQuery(
-                "crate_name must not be empty".into(),
-            ));
-        }
+        // Same `[A-Za-z0-9_-]+` rule docs.rs enforces — keeps the two
+        // halves of `get_crate_docs` in lock-step on root calls so a
+        // malformed name fails fast on both sides without a wasted
+        // upstream round-trip.
+        crate::validation::validate_crate_name_chars(crate_name)
+            .map_err(CratesIoUseCaseError::InvalidQuery)?;
         let crate_name = crate_name.to_string();
 
         let aggregate = self
@@ -197,17 +202,44 @@ fn resolve_metadata_version<'a>(
     }
 
     let asked = requested.expect("pick_latest=false implies Some");
-    aggregate
-        .versions
-        .iter()
-        .find(|v| v.num == asked)
-        .ok_or_else(|| {
-            CratesIoUseCaseError::InvalidQuery(format!(
-                "version `{}` not found for crate `{}` (semver ranges not \
-                 supported here — pass a concrete version like `1.40.0` or `latest`)",
-                asked, aggregate.name,
-            ))
-        })
+    if let Some(entry) = aggregate.versions.iter().find(|v| v.num == asked) {
+        return Ok(entry);
+    }
+    // docs.rs accepts semver ranges like `^1` / `1.*` and resolves them
+    // to a concrete build, but the crates.io per-version endpoint only
+    // takes concrete identifiers. When a range was requested, fall back
+    // to the latest-stable resolution rather than surfacing a confusing
+    // "version not found" error on the metadata side of a root call
+    // whose docs side succeeded. Typos (no range sigils, just absent)
+    // still surface as InvalidQuery so the caller learns about them.
+    if is_semver_range_like(asked) {
+        let preferred = aggregate
+            .max_stable_version
+            .as_deref()
+            .unwrap_or(aggregate.max_version.as_str());
+        if let Some(entry) = aggregate.versions.iter().find(|v| v.num == preferred) {
+            return Ok(entry);
+        }
+        return Err(CratesIoUseCaseError::InconsistentUpstream(format!(
+            "crate `{}` aggregate names latest version `{}` but it is \
+             absent from the published versions list",
+            aggregate.name, preferred,
+        )));
+    }
+    Err(CratesIoUseCaseError::InvalidQuery(format!(
+        "version `{}` not found for crate `{}` (pass a concrete version \
+         like `1.40.0`, a semver range like `^1`, or `latest`)",
+        asked, aggregate.name,
+    )))
+}
+
+/// Heuristic: does this version string look like a semver *range* rather
+/// than a concrete identifier? Used by `resolve_metadata_version` to
+/// decide whether an absent-from-versions request is a typo (reject) or
+/// a range docs.rs would resolve (fall back to latest).
+fn is_semver_range_like(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '^' | '~' | '*' | '>' | '<' | '=' | ',' | ' '))
 }
 
 /// Project the repository dependency list into the use-case summary
@@ -535,6 +567,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_resolves_semver_range_to_max_stable() -> anyhow::Result<()> {
+        // docs.rs accepts `^1` and resolves it to a concrete build; the
+        // crates.io per-version endpoint can't take ranges, so the
+        // metadata side falls back to `max_stable_version`. Best-effort
+        // by design — the resolved_version in metadata may differ from
+        // the build docs.rs serves, but that's surfaced through the
+        // separate top-level field.
+        let stub = Arc::new(CratesIoRepositoryStub::new());
+        let mut aggregate = aggregate_for(
+            "serde",
+            vec![
+                version_entry("2.0.0-beta", false),
+                version_entry("1.0.219", false),
+            ],
+        );
+        aggregate.max_version = "2.0.0-beta".into();
+        aggregate.max_stable_version = Some("1.0.219".into());
+        stub.enqueue_crate(Ok(aggregate)).await;
+        stub.enqueue_dependencies(Ok(FetchCrateVersionDependenciesRepositoryOutput {
+            dependencies: vec![],
+        }))
+        .await;
+
+        let use_case = CratesIoUseCase::new(stub);
+        let metadata = use_case
+            .get_crate_metadata(GetCrateMetadataUseCaseInput {
+                crate_name: "serde".into(),
+                version: Some("^1".into()),
+            })
+            .await?;
+
+        assert_eq!(metadata.resolved_version, "1.0.219");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn metadata_rejects_concrete_version_not_in_list() {
         // The crate exists but the requested version doesn't — surface
         // as InvalidQuery so the tool layer renders it as caller-fixable
@@ -679,6 +747,32 @@ mod tests {
             .await
             .expect_err("expected InvalidQuery for blank crate name");
         assert!(matches!(err, CratesIoUseCaseError::InvalidQuery(_)));
+    }
+
+    /// Rejects malformed crate names synchronously, matching the
+    /// `[A-Za-z0-9_-]+` rule the docs.rs use case enforces. Critical
+    /// for the parallel composition in `get_crate_docs` — without this,
+    /// docs.rs would fail synchronously while crates.io still issued a
+    /// wasted HTTP call (and produced a confusing `metadata_error`).
+    /// No upstream result is enqueued; the rejection must be local.
+    #[tokio::test]
+    async fn metadata_rejects_malformed_crate_name_without_upstream_call() {
+        let stub = Arc::new(CratesIoRepositoryStub::new());
+        let use_case = CratesIoUseCase::new(stub);
+        let err = use_case
+            .get_crate_metadata(GetCrateMetadataUseCaseInput {
+                crate_name: "foo bar".into(),
+                version: None,
+            })
+            .await
+            .expect_err("expected InvalidQuery for malformed crate name");
+        assert!(
+            matches!(
+                err,
+                CratesIoUseCaseError::InvalidQuery(ref msg) if msg.contains("disallowed"),
+            ),
+            "unexpected error: {err:?}",
+        );
     }
 
     /// When crates.io returns an aggregate whose `max_stable_version`

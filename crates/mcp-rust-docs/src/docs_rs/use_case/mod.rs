@@ -25,11 +25,6 @@ use crate::docs_rs::schema::{DocsRsItemKind, DocsRsItemSummary};
 
 const DEFAULT_VERSION: &str = "latest";
 
-/// crates.io caps published crate names at 64 ASCII characters.
-/// Mirror that bound so we never build a multi-megabyte URL out of
-/// pathological tool input.
-const MAX_CRATE_NAME_LEN: usize = 64;
-
 /// Same cap reused for `version` and `path`. docs.rs versions are
 /// short semver strings; paths point at rustdoc HTML files whose
 /// names are also short. A generous 256 covers every real case and
@@ -432,27 +427,7 @@ struct RankedHit {
 }
 
 fn validate_crate_name(name: &str) -> Result<String, DocsRsUseCaseError> {
-    if name.is_empty() {
-        return Err(DocsRsUseCaseError::InvalidInput(
-            "crate name must not be empty".into(),
-        ));
-    }
-    if name.len() > MAX_CRATE_NAME_LEN {
-        return Err(DocsRsUseCaseError::InvalidInput(format!(
-            "crate name longer than {MAX_CRATE_NAME_LEN} characters"
-        )));
-    }
-    // crates.io enforces `[A-Za-z0-9_-]+`; reject anything outside that
-    // before we go anywhere near the network, so we never accidentally
-    // smuggle path-traversal segments or query strings into the URL.
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(DocsRsUseCaseError::InvalidInput(format!(
-            "crate name contains disallowed characters: {name:?}"
-        )));
-    }
+    crate::validation::validate_crate_name_chars(name).map_err(DocsRsUseCaseError::InvalidInput)?;
     // docs.rs URLs are case-sensitive but crates.io is case-insensitive
     // on lookup. The model often capitalises crate names; quietly
     // normalising avoids a confusing 404 round-trip.

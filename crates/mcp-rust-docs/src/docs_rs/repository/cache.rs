@@ -14,6 +14,14 @@
 //! Errors are **not** cached: agents retry expecting fixes, and 404s
 //! can be transient (newly-published crate, docs.rs build pipeline lag).
 //!
+//! Consequence: `fetch_rustdoc_with_fallback` (use-case layer) walks
+//! the supported-format-version chain on every call, and each 404 in
+//! that walk re-pays a network round-trip. This is intentional — do
+//! NOT "fix" it by caching 404s. Caching a 404 from a missing
+//! format-version build would mask later successful rebuilds, and
+//! caching a transient 5xx/429 would freeze the retriable signal. The
+//! per-call walk cost is the price of correctness.
+//!
 //! ### Why no singleflight
 //!
 //! `moka::future::Cache::try_get_with` would deduplicate concurrent

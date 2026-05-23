@@ -512,6 +512,96 @@ async fn get_crate_docs_returns_docs_when_metadata_fetch_fails() -> anyhow::Resu
     Ok(())
 }
 
+/// Regression guard: when the docs.rs side of the parallel composition
+/// fails, the tool must short-circuit with an error result and discard
+/// any metadata fetched in parallel. The agent came for the docs; a
+/// successful metadata fetch alone is not a useful response, and
+/// silently flipping a docs failure into a happy `metadata`-only
+/// payload would be a subtle correctness regression.
+#[tokio::test]
+async fn get_crate_docs_fails_when_docs_fetch_fails_even_if_metadata_succeeds() -> anyhow::Result<()>
+{
+    let mock = MockServer::start().await;
+
+    // docs.rs side blows up with a 502.
+    Mock::given(method("GET"))
+        .and(path("/tokio/latest/tokio/"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // crates.io side succeeds — both endpoints get hit because
+    // `tokio::join!` polls all futures to completion before the tool
+    // checks docs_result.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/crates/tokio"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "crate": {
+                "name": "tokio",
+                "max_version": "1.40.0",
+                "max_stable_version": "1.40.0"
+            },
+            "versions": [
+                {
+                    "num": "1.40.0",
+                    "yanked": false,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "features": {}
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/crates/tokio/1.40.0/dependencies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "dependencies": []
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .crates_io_base_url(mock.uri())
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "tokio" }))),
+        )
+        .await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "docs failure must surface as a tool error, not as a metadata-only success: {result:?}",
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    assert!(
+        text.starts_with("Upstream failure:"),
+        "expected docs upstream error, got: {text}",
+    );
+    // The error payload must not leak metadata — the agent should see
+    // a clean failure, not a happy-path JSON with metadata smuggled in.
+    assert!(
+        !text.contains("\"metadata\""),
+        "metadata must not appear in the error result: {text}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_crate_docs_rejects_traversal_paths_without_calling_upstream() -> anyhow::Result<()> {
     let mock = MockServer::start().await;

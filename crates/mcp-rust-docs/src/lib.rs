@@ -35,6 +35,8 @@ pub mod docs_rs;
 pub mod error;
 /// [`Server`] builder and the constants it defaults to.
 pub mod router;
+/// Cross-layer input validators (crate-name shape, length, etc.).
+mod validation;
 
 use std::sync::Arc;
 
