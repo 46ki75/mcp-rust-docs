@@ -14,7 +14,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("starting mcp-rust-docs over stdio");
 
-    let service = Server::new()?.serve(stdio()).await.inspect_err(|err| {
+    let mut builder = Server::builder();
+    if let Ok(base_url) = std::env::var("MCP_CRATES_IO_BASE_URL") {
+        tracing::info!(%base_url, "overriding crates.io base URL");
+        builder = builder.base_url(base_url);
+    }
+
+    let service = builder.build()?.serve(stdio()).await.inspect_err(|err| {
         tracing::error!(error = ?err, "failed to start MCP server");
     })?;
 

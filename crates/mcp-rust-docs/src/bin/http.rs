@@ -19,8 +19,19 @@ async fn main() -> anyhow::Result<()> {
 
     let cancellation = tokio_util::sync::CancellationToken::new();
 
+    let base_url_override = std::env::var("MCP_CRATES_IO_BASE_URL").ok();
+    if let Some(ref base_url) = base_url_override {
+        tracing::info!(%base_url, "overriding crates.io base URL");
+    }
+
     let service = StreamableHttpService::new(
-        || Server::new().map_err(std::io::Error::other),
+        move || {
+            let mut builder = Server::builder();
+            if let Some(ref base_url) = base_url_override {
+                builder = builder.base_url(base_url.clone());
+            }
+            builder.build().map_err(std::io::Error::other)
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_cancellation_token(cancellation.child_token()),
     );
