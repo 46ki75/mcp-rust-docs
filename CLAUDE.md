@@ -10,7 +10,7 @@ crates.io. The crate ships as a single binary, `mcp-rust-docs`, with
 two transport subcommands:
 
 - `mcp-rust-docs stdio` — line-buffered JSON-RPC over stdin/stdout
-- `mcp-rust-docs http`  — streamable HTTP, mounted at `/mcp`
+- `mcp-rust-docs http` — streamable HTTP, mounted at `/mcp`
 
 Both accept `--crates-io-base-url` (env `MCP_CRATES_IO_BASE_URL`)
 to point at a wiremock fixture or registry mirror. The HTTP subcommand
@@ -21,7 +21,7 @@ accepts `--bind` (env `MCP_BIND_ADDRESS`, default `127.0.0.1:8000`).
 All workflows run through `just` — `cargo` is never invoked directly
 in CI, scripts, or docs.
 
-```
+```bash
 just ci            # gating check: fmt-check + clippy + hermetic tests
 just test          # hermetic tests only
 just fmt           # apply rustfmt
@@ -50,7 +50,7 @@ The library follows the org-wide three-layer pattern documented in the
 `development-standards` skill (repository → use case → tool), with
 strict type isolation at each boundary:
 
-```
+```tree
 crates/mcp-rust-docs/src/crates_io/
 ├── repository/    HTTP I/O against crates.io. Owns reqwest. Returns
 │                  RepositoryCrateRecord (raw shape: both max_version
