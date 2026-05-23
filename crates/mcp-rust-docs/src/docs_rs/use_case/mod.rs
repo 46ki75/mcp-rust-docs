@@ -532,6 +532,11 @@ fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String
         ItemKind::Macro => ("macro", format!("{dir}macro.{last}.html")),
         ItemKind::ProcDerive => ("derive", format!("{dir}derive.{last}.html")),
         ItemKind::ProcAttribute => ("attribute", format!("{dir}attr.{last}.html")),
+        // `Attribute` (core's built-in attribute docs, e.g.
+        // `#[no_mangle]`) uses the same `attr.{name}.html` URL shape as
+        // `ProcAttribute`. Bundled under the same `"attribute"` kind so
+        // a `kinds: ["attribute"]` filter covers both.
+        ItemKind::Attribute => ("attribute", format!("{dir}attr.{last}.html")),
         ItemKind::Primitive => ("primitive", format!("{dir}primitive.{last}.html")),
         ItemKind::Keyword => ("keyword", format!("{dir}keyword.{last}.html")),
         // Items without a dedicated page (impls, fields, variants,
@@ -580,9 +585,18 @@ fn count_substr(haystack: &str, needle: &str) -> usize {
 /// on either side when the slice doesn't cover the full body. Snaps to
 /// char boundaries so we never split a multi-byte sequence.
 fn snippet_around(docs: &str, docs_lower: &str, needle_lower: &str, target_chars: usize) -> String {
-    let hit = docs_lower.find(needle_lower).unwrap_or(0);
+    let hit_lower = docs_lower.find(needle_lower).unwrap_or(0);
+    // `hit_lower` is a byte position in `docs_lower`, not in `docs`.
+    // Translate it back: when a char's lowercase form has a different
+    // byte length than the original (e.g. `İ` U+0130 is 2 bytes but
+    // lowercases to `i\u{307}` which is 3) the two indices diverge.
+    let hit = translate_lower_index_to_docs(docs, hit_lower);
     let half = target_chars / 2;
     let start_byte = floor_char_boundary(docs, hit.saturating_sub(half));
+    // The trailing window uses `needle_lower.len()` (lowercase-coordinate
+    // byte length); the `± half` slack absorbs any drift, so the match
+    // is always visible even if the snippet is slightly off-center on
+    // the trailing side.
     let end_target = hit.saturating_add(needle_lower.len()).saturating_add(half);
     let end_byte = ceil_char_boundary(docs, end_target.min(docs.len()));
 
@@ -596,6 +610,28 @@ fn snippet_around(docs: &str, docs_lower: &str, needle_lower: &str, target_chars
         .trim()
         .to_string();
     format!("{prefix}{body}{suffix}")
+}
+
+/// Translate a byte index from the lowercased form of `docs` back to
+/// the corresponding byte index in the original `docs`.
+///
+/// Walks `docs` char by char, accumulating both the original byte
+/// length and the lowercased byte length in parallel. When the
+/// lowercased counter reaches `hit_lower`, the original counter holds
+/// the matching offset. Needed because some chars change byte length
+/// under [`str::to_lowercase`] (`İ` 2 → 3 bytes, `ẞ` 3 → 2 bytes), so
+/// the two byte coordinate spaces are not interchangeable.
+fn translate_lower_index_to_docs(docs: &str, hit_lower: usize) -> usize {
+    let mut docs_byte = 0usize;
+    let mut lower_byte = 0usize;
+    for ch in docs.chars() {
+        if lower_byte >= hit_lower {
+            break;
+        }
+        docs_byte += ch.len_utf8();
+        lower_byte += ch.to_lowercase().map(|c| c.len_utf8()).sum::<usize>();
+    }
+    docs_byte
 }
 
 /// `str::floor_char_boundary` is still nightly-only; this is the
@@ -1515,6 +1551,51 @@ mod tests {
         // No panic == passing. Sanity: result must round-trip as UTF-8
         // (which it does by construction, but check anyway).
         assert!(snippet.is_char_boundary(0) && snippet.is_char_boundary(snippet.len()));
+    }
+
+    #[test]
+    fn snippet_around_keeps_match_when_lowercasing_changes_byte_length() {
+        // Rust's default Unicode case-mapping lowercases `İ` (U+0130,
+        // 2 bytes) to `i\u{307}` (3 bytes), so `docs_lower` is *longer*
+        // than `docs`. The byte index returned by
+        // `docs_lower.find(needle_lower)` therefore does NOT correspond
+        // to the same character in the original `docs`. Centering the
+        // snippet on that index drifts past the actual match — with a
+        // small window the resulting snippet can miss the match entirely.
+        let docs = "İİİİİPinXXXXX";
+        let docs_lower = docs.to_lowercase();
+        // Sanity-check the precondition that drives the bug: lowercasing
+        // must have stretched the string. If a future stdlib change made
+        // this no longer true the test would be vacuous, not silently
+        // passing.
+        assert!(
+            docs_lower.len() > docs.len(),
+            "test premise broken: docs_lower must be longer than docs",
+        );
+        let snippet = snippet_around(docs, &docs_lower, "pin", 6);
+        assert!(
+            snippet.to_lowercase().contains("pin"),
+            "snippet must contain the match (case-insensitive); got {snippet:?}",
+        );
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_maps_attribute() {
+        // `ItemKind::Attribute` is core's built-in attribute documentation
+        // (e.g. `#[no_mangle]`, `#[repr]`); rustdoc emits an
+        // `attr.{name}.html` page for it, the same shape as `ProcAttribute`.
+        // Currently this kind falls through to the catch-all `_ => None`,
+        // so built-in attribute items are silently dropped from grep
+        // results even though they're addressable pages.
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec!["core".into(), "no_mangle".into()],
+            kind: rustdoc_types::ItemKind::Attribute,
+        };
+        let (kind, path) =
+            rustdoc_kind_and_path(&summary).expect("Attribute must map to a doc page");
+        assert_eq!(kind, "attribute");
+        assert_eq!(path, "attr.no_mangle.html");
     }
 
     #[test]
