@@ -200,6 +200,7 @@ mod tests {
         let stub = Arc::new(CratesIoRepositoryStub::new());
         stub.enqueue(Err(CratesIoRepositoryError::UpstreamStatus {
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            url: "https://crates.io/api/v1/crates".into(),
             body: "down for maintenance".into(),
         }))
         .await;

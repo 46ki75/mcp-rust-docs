@@ -14,10 +14,14 @@ pub enum CratesIoRepositoryError {
 
     /// The registry returned a non-2xx response. Body is captured
     /// verbatim — may be JSON or plain text.
-    #[error("crates.io returned HTTP {status}: {body}")]
+    #[error("crates.io returned HTTP {status} for {url}: {body}")]
     UpstreamStatus {
         /// HTTP status code returned by the registry.
         status: reqwest::StatusCode,
+        /// URL that triggered the failure. Mirrors the same field on
+        /// `DocsRsRepositoryError::UpstreamStatus` so operators get
+        /// matching diagnostics from both upstreams.
+        url: String,
         /// Raw response body, kept for diagnostics.
         body: String,
     },

@@ -80,7 +80,7 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                return Err(CratesIoRepositoryError::UpstreamStatus { status, body });
+                return Err(CratesIoRepositoryError::UpstreamStatus { status, url, body });
             }
 
             let body_bytes = response.bytes().await?;
