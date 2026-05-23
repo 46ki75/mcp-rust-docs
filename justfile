@@ -33,9 +33,11 @@ coverage-ci: test-cov
 test-live:
     cargo test --workspace -- --ignored
 
-# Instrumented live test run (mirrors test-cov)
+# Instrumented run of the full suite PLUS live tests. `--include-ignored`
+# (not `--ignored`) so the report reflects combined coverage, not just
+# what the 5 live tests happen to touch.
 test-live-cov:
-    cargo llvm-cov --no-report --workspace -- --ignored
+    cargo llvm-cov --no-report --workspace -- --include-ignored
 
 coverage-live: test-live-cov
     cargo llvm-cov report --show-missing-lines --color=always 2>&1 | grep -v " 100.00%"
