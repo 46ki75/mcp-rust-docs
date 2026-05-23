@@ -15,7 +15,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Honors rust-toolchain.toml (currently pinned to 1.90), installs
       # rustfmt + clippy as declared there, and sets up cargo caching.
