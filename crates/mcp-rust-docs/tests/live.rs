@@ -155,6 +155,65 @@ async fn live_get_crate_docs_returns_markdown_for_serde_root() -> anyhow::Result
 }
 
 #[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_search_crate_symbols_finds_serde_deserialize_trait() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_symbols").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "Deserialize",
+                "kinds": ["trait"],
+                "limit": 10,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    // The Deserialize trait MUST appear when searching serde for
+    // "Deserialize" + kind=trait. If this regresses, the parser is
+    // missing a section or the URL convention has drifted.
+    let items = parsed["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|i| i["name"] == "Deserialize"),
+        "Deserialize trait missing from serde symbol search: {parsed}",
+    );
+    // The returned path should be the one get_crate_docs accepts.
+    let trait_item = items
+        .iter()
+        .find(|i| i["name"] == "Deserialize")
+        .expect("Deserialize entry");
+    let path = trait_item["path"].as_str().expect("path string");
+    assert!(
+        path.starts_with("trait.Deserialize.html"),
+        "unexpected path for Deserialize trait: {path}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {
     let server = Server::new()?;

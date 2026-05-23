@@ -8,8 +8,8 @@ pub mod output;
 use std::sync::Arc;
 
 pub use self::error::DocsRsUseCaseError;
-pub use self::input::FetchCrateDocsUseCaseInput;
-pub use self::output::FetchCrateDocsUseCaseOutput;
+pub use self::input::{FetchCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput};
+pub use self::output::{FetchCrateDocsUseCaseOutput, SearchCrateSymbolsUseCaseOutput, SymbolEntry};
 
 use crate::docs_rs::repository::{
     DocsRsRepository, FetchCrateDocsRepositoryInput, FetchCrateDocsRepositoryOutput,
@@ -28,6 +28,18 @@ const MAX_CRATE_NAME_LEN: usize = 64;
 /// still bounds the URL size.
 const MAX_VERSION_LEN: usize = 64;
 const MAX_PATH_LEN: usize = 256;
+
+/// Cap on the symbol-search query string. Substring matching against
+/// item names rarely needs more than a handful of characters; bounding
+/// this stops a runaway tool input from forcing us to scan a long
+/// pattern across every all.html entry.
+const MAX_SYMBOL_QUERY_LEN: usize = 128;
+
+/// Default and maximum result count for symbol search. The cap keeps
+/// response sizes bounded so a query like `""` against `tokio` (which
+/// has ~1k items) can't return them all in one shot.
+const DEFAULT_SYMBOL_LIMIT: u32 = 50;
+const MAX_SYMBOL_LIMIT: u32 = 500;
 
 /// Use case for fetching crate documentation from docs.rs.
 ///
@@ -83,6 +95,69 @@ impl DocsRsUseCase {
             resolved_version,
             final_url,
             markdown,
+        })
+    }
+
+    /// Fetch `all.html` for the crate, parse the public-item index,
+    /// then filter by `query` (case-insensitive substring on the
+    /// qualified name) and `kinds`. The matched list is truncated to
+    /// `limit`; `total_matched` reports the pre-truncation count so
+    /// callers know when to narrow the query.
+    #[tracing::instrument(skip(self))]
+    pub async fn search_crate_symbols(
+        &self,
+        input: SearchCrateSymbolsUseCaseInput,
+    ) -> Result<SearchCrateSymbolsUseCaseOutput, DocsRsUseCaseError> {
+        let crate_name = validate_crate_name(input.crate_name.trim())?;
+        let version = match input.version.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_VERSION.to_string(),
+            Some(v) => validate_version(v)?,
+        };
+        let query = match input.query.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(q) => Some(validate_symbol_query(q)?),
+        };
+        // An empty `kinds` array means the caller didn't intend to
+        // filter — collapse to `None` so we don't silently drop every
+        // item and confuse the caller with `total_matched: 0`.
+        let kinds: Option<Vec<String>> = input
+            .kinds
+            .map(|ks| {
+                ks.into_iter()
+                    .map(|k| k.trim().to_ascii_lowercase())
+                    .filter(|k| !k.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ks: &Vec<String>| !ks.is_empty());
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_SYMBOL_LIMIT)
+            .clamp(1, MAX_SYMBOL_LIMIT) as usize;
+
+        let url = build_all_html_url(&self.base_url, &crate_name, &version);
+
+        let FetchCrateDocsRepositoryOutput { final_url, html } = self
+            .repository
+            .fetch_crate_docs(FetchCrateDocsRepositoryInput { url })
+            .await?;
+
+        let resolved_version = parse_version_from_url(&self.base_url, &crate_name, &final_url);
+
+        let all_entries = parse_all_html(&html);
+        let mut matched: Vec<SymbolEntry> = all_entries
+            .into_iter()
+            .filter(|entry| match_filters(entry, query.as_deref(), kinds.as_deref()))
+            .collect();
+        let total_matched = matched.len();
+        let truncated = matched.len() > limit;
+        matched.truncate(limit);
+
+        Ok(SearchCrateSymbolsUseCaseOutput {
+            crate_name,
+            resolved_version,
+            total_matched,
+            truncated,
+            items: matched,
         })
     }
 }
@@ -199,6 +274,192 @@ fn build_url(base_url: &str, crate_name: &str, version: &str, path: Option<&str>
     match path {
         Some(p) => format!("{base}/{crate_name}/{version}/{lib_name}/{p}"),
         None => format!("{base}/{crate_name}/{version}/{lib_name}/"),
+    }
+}
+
+fn build_all_html_url(base_url: &str, crate_name: &str, version: &str) -> String {
+    build_url(base_url, crate_name, version, Some("all.html"))
+}
+
+fn validate_symbol_query(query: &str) -> Result<String, DocsRsUseCaseError> {
+    if query.len() > MAX_SYMBOL_QUERY_LEN {
+        return Err(DocsRsUseCaseError::InvalidInput(format!(
+            "query longer than {MAX_SYMBOL_QUERY_LEN} characters"
+        )));
+    }
+    if query.chars().any(|c| c.is_control()) {
+        return Err(DocsRsUseCaseError::InvalidInput(
+            "query must not contain control characters".into(),
+        ));
+    }
+    Ok(query.to_string())
+}
+
+fn match_filters(entry: &SymbolEntry, query: Option<&str>, kinds: Option<&[String]>) -> bool {
+    if let Some(kinds) = kinds
+        && !kinds.iter().any(|k| k == &entry.kind)
+    {
+        return false;
+    }
+    if let Some(q) = query {
+        // Both sides are ASCII in any realistic case (rustdoc items),
+        // but `to_lowercase` is the standards-compliant Unicode form.
+        // Cost is negligible compared to the network fetch above.
+        let name_l = entry.name.to_lowercase();
+        let q_l = q.to_lowercase();
+        if !name_l.contains(&q_l) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse a rustdoc `all.html` page into a flat list of `SymbolEntry`.
+///
+/// The page has a uniform structure: one `<h3 id="kind">` per item
+/// kind, followed by `<ul class="all-items">` of
+/// `<li><a href="path-to-item.html">qualified::name</a></li>` rows.
+/// rustdoc has emitted this shape consistently for years, so a
+/// hand-rolled string walker is robust enough — no HTML parser dep
+/// required.
+///
+/// On malformed or unexpected input the walker stops at the first
+/// missing delimiter and returns whatever it parsed so far. We'd
+/// rather hand back a partial list than fail the whole tool call.
+fn parse_all_html(html: &str) -> Vec<SymbolEntry> {
+    // Scope to <main> so we never pick up sidebar/footer link lists,
+    // which would otherwise pollute the symbol index.
+    let scope = extract_main_content(html);
+    let mut entries = Vec::new();
+
+    // Sections are introduced by `<h3 ` — split on that marker and
+    // process each section chunk independently. Within each chunk we
+    // hunt for `id="..."` and the items, both defensively: rustdoc
+    // could plausibly reorder or add HTML attributes, and we'd rather
+    // keep working than silently drop sections.
+    for chunk in scope.split("<h3 ").skip(1) {
+        let Some(tag_end) = chunk.find('>') else {
+            continue;
+        };
+        let h3_attrs = &chunk[..tag_end];
+        let Some(rustdoc_kind) = find_attr(h3_attrs, "id") else {
+            continue;
+        };
+        let kind = normalise_kind(rustdoc_kind);
+
+        // Body starts after the `<h3 …>` close. Item links use
+        // `<li>` wrapping `<a href="…">`; we tolerate extra attributes
+        // on either by hunting for `<li>` then the next `<a` after it.
+        let body = &chunk[tag_end + 1..];
+        const LI_OPEN: &str = "<li>";
+        const CLOSE_TAG: &str = "</a></li>";
+        let mut cursor = 0;
+        while let Some(li_rel) = body[cursor..].find(LI_OPEN) {
+            let after_li = cursor + li_rel + LI_OPEN.len();
+            // Find the first `<a ` (or `<a>`) after the `<li>`. If
+            // there isn't one before the next `<li>`, skip this row.
+            let next_li_abs = body[after_li..]
+                .find(LI_OPEN)
+                .map(|r| after_li + r)
+                .unwrap_or(body.len());
+            let li_inner = &body[after_li..next_li_abs];
+            let Some(a_rel) = li_inner.find("<a") else {
+                cursor = next_li_abs;
+                continue;
+            };
+            let after_a = after_li + a_rel + 2; // past `<a`
+            let a_tag_slice = &body[after_a..];
+            let Some(a_tag_end) = a_tag_slice.find('>') else {
+                break;
+            };
+            let a_attrs = &a_tag_slice[..a_tag_end];
+            let Some(path) = find_attr(a_attrs, "href") else {
+                cursor = next_li_abs;
+                continue;
+            };
+            let after_open_tag = after_a + a_tag_end + 1;
+            let after_open = &body[after_open_tag..];
+            let Some(close_rel) = after_open.find(CLOSE_TAG) else {
+                break;
+            };
+            let raw_name = &after_open[..close_rel];
+            // rustdoc historically wraps the link text in plain text,
+            // but newer versions may wrap it in `<code>` or `<span>`.
+            // Strip any tags so substring matching against the
+            // caller's query stays meaningful.
+            let name = strip_tags(raw_name);
+
+            entries.push(SymbolEntry {
+                kind: kind.to_string(),
+                name,
+                path: path.to_string(),
+            });
+
+            cursor = after_open_tag + close_rel + CLOSE_TAG.len();
+        }
+    }
+    entries
+}
+
+/// Find `name="value"` in an HTML open-tag attribute span. Returns
+/// the value if present; otherwise `None`. Whitespace before the
+/// attribute is implied by the way we slice (the leading space of
+/// `<h3 id=...>` is consumed by the `<h3 ` split). The match also
+/// allows other characters preceding the attribute (e.g.
+/// `class="x" id="y"`) by searching for ` name="` first.
+fn find_attr<'a>(open_tag_attrs: &'a str, name: &str) -> Option<&'a str> {
+    // Try `name="` at the very start, then ` name="` anywhere else.
+    // This handles both `id="…"` (start of attrs) and `class="…" id="…"`.
+    let lead = format!("{name}=\"");
+    let mid = format!(" {name}=\"");
+    let start = if let Some(s) = open_tag_attrs.strip_prefix(&lead) {
+        s
+    } else {
+        let mid_pos = open_tag_attrs.find(mid.as_str())?;
+        &open_tag_attrs[mid_pos + mid.len()..]
+    };
+    let end = start.find('"')?;
+    Some(&start[..end])
+}
+
+/// Strip HTML tags from a short fragment of inline content, leaving
+/// only the text. Used to clean up rustdoc link bodies that may wrap
+/// the visible name in `<code>` or `<span class=…>`. Not a general
+/// HTML sanitiser — just a cheap "drop everything between `<` and
+/// the matching `>`" pass.
+fn strip_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for c in input.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Map rustdoc's plural section ids to the singular kinds used in
+/// the public DTO and `kinds` filter. Unknown ids pass through
+/// verbatim so future rustdoc additions still surface.
+fn normalise_kind(rustdoc_id: &str) -> &str {
+    match rustdoc_id {
+        "structs" => "struct",
+        "enums" => "enum",
+        "traits" => "trait",
+        "unions" => "union",
+        "macros" => "macro",
+        "derives" => "derive",
+        "attributes" => "attribute",
+        "functions" => "fn",
+        "types" => "type",
+        "modules" => "module",
+        "constants" => "constant",
+        "statics" => "static",
+        "primitives" => "primitive",
+        other => other,
     }
 }
 
@@ -560,5 +821,307 @@ mod tests {
     fn parse_version_returns_none_for_unexpected_shape() {
         let v = parse_version_from_url(BASE_URL, "tokio", "https://docs.rs/about");
         assert_eq!(v, None);
+    }
+
+    /// Mini all.html fixture — same shape as real rustdoc output,
+    /// just trimmed down. Sidebar content outside `<main>` is included
+    /// to verify it gets dropped by the scope guard.
+    const ALL_HTML_FIXTURE: &str = r#"<html><body>
+        <nav class="sidebar">
+            <ul><li><a href="evil/struct.Bad.html">Sidebar::Bad</a></li></ul>
+        </nav>
+        <main><section id="main-content" class="content">
+            <h1>List of all items</h1>
+            <h3 id="structs">Structs</h3>
+            <ul class="all-items">
+                <li><a href="struct.Error.html">Error</a></li>
+                <li><a href="de/struct.IgnoredAny.html">de::IgnoredAny</a></li>
+                <li><a href="de/value/struct.U8Deserializer.html">de::value::U8Deserializer</a></li>
+            </ul>
+            <h3 id="traits">Traits</h3>
+            <ul class="all-items">
+                <li><a href="trait.Deserialize.html">Deserialize</a></li>
+                <li><a href="ser/trait.Serializer.html">ser::Serializer</a></li>
+            </ul>
+            <h3 id="derives">Derive Macros</h3>
+            <ul class="all-items">
+                <li><a href="derive.Deserialize.html">Deserialize</a></li>
+            </ul>
+        </section></main>
+    </body></html>"#;
+
+    #[test]
+    fn parse_all_html_extracts_kind_normalised_entries() {
+        let entries = parse_all_html(ALL_HTML_FIXTURE);
+        let names: Vec<_> = entries.iter().map(|e| (&e.kind[..], &e.name[..])).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("struct", "Error"),
+                ("struct", "de::IgnoredAny"),
+                ("struct", "de::value::U8Deserializer"),
+                ("trait", "Deserialize"),
+                ("trait", "ser::Serializer"),
+                ("derive", "Deserialize"),
+            ],
+        );
+        assert!(
+            entries.iter().all(|e| e.name != "Sidebar::Bad"),
+            "sidebar entry leaked: {entries:?}",
+        );
+    }
+
+    #[test]
+    fn parse_all_html_returns_paths_verbatim() {
+        let entries = parse_all_html(ALL_HTML_FIXTURE);
+        let item = entries
+            .iter()
+            .find(|e| e.name == "de::value::U8Deserializer")
+            .expect("U8Deserializer in fixture");
+        assert_eq!(item.path, "de/value/struct.U8Deserializer.html");
+    }
+
+    #[test]
+    fn parse_all_html_tolerates_unknown_kind() {
+        // Future rustdoc could add a section we don't know about.
+        // Unknown kinds should pass through verbatim so callers can
+        // still find the items rather than have them silently dropped.
+        let html = r#"<main>
+            <h3 id="lifetimes">Lifetimes</h3>
+            <ul><li><a href="lt.something.html">'a</a></li></ul>
+        </main>"#;
+        let entries = parse_all_html(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "lifetimes");
+    }
+
+    #[test]
+    fn parse_all_html_returns_empty_for_non_rustdoc_page() {
+        let html = "<html><body><p>Sorry, we couldn't find that.</p></body></html>";
+        assert!(parse_all_html(html).is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_symbols_filters_by_substring_case_insensitive() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/serde/1.0.200/serde/all.html".into(),
+            html: ALL_HTML_FIXTURE.into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub.clone());
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: Some("desER".into()),
+                kinds: None,
+                limit: None,
+            })
+            .await?;
+
+        let matched_names: Vec<_> = out.items.iter().map(|i| i.name.clone()).collect();
+        assert!(
+            matched_names.iter().any(|n| n == "Deserialize"),
+            "missing Deserialize: {matched_names:?}",
+        );
+        assert!(
+            matched_names
+                .iter()
+                .any(|n| n == "de::value::U8Deserializer"),
+            "missing U8Deserializer: {matched_names:?}",
+        );
+        assert_eq!(out.resolved_version.as_deref(), Some("1.0.200"));
+        assert_eq!(
+            stub.last_seen_url().await.as_deref(),
+            Some("https://docs.rs/serde/latest/serde/all.html"),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_symbols_respects_kind_filter() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/serde/1.0.200/serde/all.html".into(),
+            html: ALL_HTML_FIXTURE.into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: Some("deserialize".into()),
+                kinds: Some(vec!["TRAIT".into()]),
+                limit: None,
+            })
+            .await?;
+
+        assert_eq!(out.total_matched, 1);
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].kind, "trait");
+        assert_eq!(out.items[0].name, "Deserialize");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_symbols_returns_all_with_empty_query() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/serde/1.0.200/serde/all.html".into(),
+            html: ALL_HTML_FIXTURE.into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: Some("   ".into()),
+                kinds: None,
+                limit: None,
+            })
+            .await?;
+
+        assert_eq!(out.total_matched, 6);
+        assert!(!out.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_symbols_truncates_to_limit_and_reports_total() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/serde/1.0.200/serde/all.html".into(),
+            html: ALL_HTML_FIXTURE.into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: None,
+                kinds: None,
+                limit: Some(2),
+            })
+            .await?;
+
+        assert_eq!(out.items.len(), 2);
+        assert_eq!(out.total_matched, 6);
+        assert!(out.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_symbols_rejects_overlong_query() {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        let use_case = use_case_with(stub);
+
+        let err = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: Some("x".repeat(129)),
+                kinds: None,
+                limit: None,
+            })
+            .await
+            .expect_err("expected validation error");
+        assert!(matches!(err, DocsRsUseCaseError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn search_symbols_treats_empty_kinds_array_as_no_filter() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/serde/1.0.200/serde/all.html".into(),
+            html: ALL_HTML_FIXTURE.into(),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "serde".into(),
+                version: None,
+                query: None,
+                kinds: Some(vec![]),
+                limit: None,
+            })
+            .await?;
+
+        // 6 entries in the fixture; an empty kinds array means "no
+        // filter", not "match nothing".
+        assert_eq!(out.total_matched, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_all_html_handles_reordered_h3_attributes() {
+        // rustdoc could plausibly add a class before the id; our
+        // walker should still find the kind via the attribute hunt.
+        let html = r#"<main>
+            <h3 class="section-header" id="traits">Traits</h3>
+            <ul><li><a class="trait" href="trait.Foo.html">Foo</a></li></ul>
+        </main>"#;
+        let entries = parse_all_html(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "trait");
+        assert_eq!(entries[0].name, "Foo");
+        assert_eq!(entries[0].path, "trait.Foo.html");
+    }
+
+    #[test]
+    fn parse_all_html_strips_inner_markup_from_names() {
+        // Newer rustdoc versions wrap names in <code>. Without
+        // stripping, substring matching against the user's query
+        // would silently break.
+        let html = r#"<main>
+            <h3 id="structs">Structs</h3>
+            <ul><li><a href="struct.Foo.html"><code>de::Foo</code></a></li></ul>
+        </main>"#;
+        let entries = parse_all_html(html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "de::Foo");
+    }
+
+    #[tokio::test]
+    async fn search_symbols_clamps_limit_above_max() -> anyhow::Result<()> {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        let mut huge = String::from(r#"<main><h3 id="structs">Structs</h3><ul>"#);
+        for i in 0..600 {
+            huge.push_str(&format!("<li><a href=\"struct.S{i}.html\">S{i}</a></li>"));
+        }
+        huge.push_str("</ul></main>");
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/x/1.0.0/x/all.html".into(),
+            html: huge,
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .search_crate_symbols(SearchCrateSymbolsUseCaseInput {
+                crate_name: "x".into(),
+                version: None,
+                query: None,
+                kinds: None,
+                limit: Some(10_000),
+            })
+            .await?;
+
+        assert_eq!(
+            out.items.len(),
+            500,
+            "limit should clamp to MAX_SYMBOL_LIMIT"
+        );
+        assert_eq!(out.total_matched, 600);
+        Ok(())
     }
 }

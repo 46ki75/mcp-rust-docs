@@ -22,3 +22,33 @@ pub struct FetchCrateDocsUseCaseInput {
     /// `sync/index.html`. `None` fetches the crate root.
     pub path: Option<String>,
 }
+
+/// Pre-validation arguments for the symbol-search operation.
+///
+/// `query` is matched as a case-insensitive substring against the
+/// fully-qualified item name (e.g. `de::value::U8Deserializer`).
+/// `kinds` filters by the rustdoc-normalised kind (`struct`, `enum`,
+/// `trait`, `fn`, …). `limit` caps the number of returned items; the
+/// total match count is reported separately so callers know when
+/// they've been truncated.
+#[derive(Debug, Clone)]
+pub struct SearchCrateSymbolsUseCaseInput {
+    /// Crate name. Same normalisation as
+    /// [`FetchCrateDocsUseCaseInput::crate_name`].
+    pub crate_name: String,
+    /// Optional version selector. `None`/`"latest"` resolve to
+    /// docs.rs's `latest` alias.
+    pub version: Option<String>,
+    /// Optional substring filter. `None` or empty matches every item.
+    pub query: Option<String>,
+    /// Optional kind filter. Use case-insensitive normalised names
+    /// (`struct`, `enum`, `trait`, `fn`, `macro`, `derive`,
+    /// `attribute`, `type`, `module`, `constant`, `static`, `union`,
+    /// `primitive`). Unknown kinds are silently ignored — the use
+    /// case treats them as "match nothing", not an error, so callers
+    /// can pass forward-compatible lists.
+    pub kinds: Option<Vec<String>>,
+    /// Optional cap on returned items. The use case defaults this to
+    /// 50 and clamps to 500 to keep response sizes bounded.
+    pub limit: Option<u32>,
+}

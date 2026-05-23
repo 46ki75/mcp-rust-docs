@@ -90,6 +90,56 @@ async fn stdio_child_lists_search_crates_tool() -> anyhow::Result<()> {
         names.contains(&"get_crate_docs"),
         "get_crate_docs not advertised by stdio child: {names:?}",
     );
+    assert!(
+        names.contains(&"search_crate_symbols"),
+        "search_crate_symbols not advertised by stdio child: {names:?}",
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_child_returns_symbols_from_search_crate_symbols() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/serde/latest/serde/all.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<main>
+                <h3 id="traits">Traits</h3>
+                <ul><li><a href="trait.Serializer.html">Serializer</a></li></ul>
+            </main>"#,
+        ))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let client = spawn_stdio_child(&mock.uri()).await?;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_symbols").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "serial",
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["total_matched"], 1);
+    assert_eq!(parsed["items"][0]["name"], "Serializer");
 
     client.cancel().await?;
     Ok(())

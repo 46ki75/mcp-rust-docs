@@ -18,3 +18,42 @@ pub struct FetchCrateDocsUseCaseOutput {
     /// Page contents converted to Markdown.
     pub markdown: String,
 }
+
+/// Result returned by the symbol-search use case.
+///
+/// `total_matched` is the number of items that satisfied the filters
+/// *before* truncation; compare against `items.len()` (or check
+/// `truncated`) to know whether the caller needs to narrow the query.
+#[derive(Debug, Clone)]
+pub struct SearchCrateSymbolsUseCaseOutput {
+    /// Crate name as requested (post-normalisation).
+    pub crate_name: String,
+    /// Concrete version docs.rs served the `all.html` from, parsed
+    /// out of the final URL. `None` if the URL shape was unexpected.
+    pub resolved_version: Option<String>,
+    /// Total items matching `query`/`kinds` before `limit` was
+    /// applied.
+    pub total_matched: usize,
+    /// `true` when more items matched than the limit returned.
+    pub truncated: bool,
+    /// Matched items in the order they appeared in `all.html`
+    /// (alphabetical within each kind, grouped by kind in rustdoc's
+    /// preferred order: structs, enums, traits, …).
+    pub items: Vec<SymbolEntry>,
+}
+
+/// One item from a crate's `all.html` page.
+#[derive(Debug, Clone)]
+pub struct SymbolEntry {
+    /// Normalised rustdoc kind: `struct`, `enum`, `trait`, `fn`,
+    /// `macro`, `derive`, `attribute`, `type`, `module`, `constant`,
+    /// `static`, `union`, `primitive`.
+    pub kind: String,
+    /// Fully-qualified item name as rustdoc renders it
+    /// (e.g. `de::value::U8Deserializer`).
+    pub name: String,
+    /// URL-path tail relative to the crate's docs root
+    /// (e.g. `de/value/struct.U8Deserializer.html`). Use this
+    /// verbatim as the `path` argument to `get_crate_docs`.
+    pub path: String,
+}

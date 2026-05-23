@@ -1,10 +1,12 @@
 //! MCP server exposing Rust ecosystem tools.
 //!
-//! Currently ships two tools:
+//! Currently ships three tools:
 //!
 //! - `search_crates` — queries the crates.io registry.
 //! - `get_crate_docs` — fetches a documentation page from docs.rs
 //!   and returns it as Markdown.
+//! - `search_crate_symbols` — lists public items in a crate by name,
+//!   handing back paths that `get_crate_docs` accepts.
 //!
 //! A single binary, `mcp-rust-docs`, adapts this library to the two
 //! MCP transports an editor host cares about, selected by subcommand:
@@ -106,8 +108,10 @@ impl ServerHandler for Server {
         info.server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
             "Rust ecosystem tools. `search_crates` queries the crates.io \
-             registry; `get_crate_docs` fetches a page from docs.rs and \
-             returns it as Markdown."
+             registry; `search_crate_symbols` lists a crate's public items \
+             by name; `get_crate_docs` fetches a page from docs.rs and \
+             returns it as Markdown. Typical flow: search_crates → \
+             search_crate_symbols → get_crate_docs."
                 .to_string(),
         );
         info
