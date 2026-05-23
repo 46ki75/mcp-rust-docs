@@ -1,0 +1,107 @@
+name: publish
+
+# Triggered when a `v*` tag is pushed (the conventional "release this"
+# signal), or on manual dispatch for testing the pipeline with the
+# `dry-run` toggle.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run cargo publish --dry-run only, do not actually publish."
+        type: boolean
+        default: false
+
+# `id-token: write` enables OIDC, the basis for crates.io trusted
+# publishing — no long-lived API token in repo secrets.
+# `contents: write` is needed only by the "Create GitHub release"
+# step at the end of the job; everything before it is read-only.
+permissions:
+  contents: write
+  id-token: write
+
+# Never cancel a publish in-flight — even if a second tag lands.
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # Catches the common mistake of pushing a tag without bumping
+      # Cargo.toml (or vice versa). Failing here is much cheaper than
+      # failing inside `cargo publish` after the full build.
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "mcp-rust-docs") | .version')
+          if [ "$TAG" != "$CRATE_VERSION" ]; then
+            echo "::error::Tag v${TAG} does not match Cargo.toml version ${CRATE_VERSION}"
+            exit 1
+          fi
+          echo "Publishing mcp-rust-docs v${CRATE_VERSION}"
+
+      - name: just ci
+        run: just ci
+
+      # Exchanges the GitHub OIDC token for a short-lived crates.io
+      # registry token. Requires the repo to be configured under
+      # crates.io → Settings → Trusted Publishing for this workflow.
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # Always run the dry-run as a packaging-sanity check (catches
+      # missing readme/license, oversize includes, etc.) before the
+      # real publish.
+      - name: cargo publish --dry-run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p mcp-rust-docs --dry-run
+
+      - name: cargo publish
+        if: ${{ inputs.dry-run != true }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p mcp-rust-docs
+
+      # Only on tag-push, and only after a successful real publish.
+      # A semver pre-release suffix (anything after `-`, e.g.
+      # `1.0.0-alpha.0`, `1.2.0-rc.1`) marks the GitHub release as
+      # Pre-release so it doesn't get the "Latest" badge.
+      - name: Create GitHub release
+        if: ${{ github.event_name == 'push' && inputs.dry-run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Detected pre-release version: $VERSION"
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --prerelease
+          else
+            echo "Detected stable release version: $VERSION"
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --latest
+          fi
