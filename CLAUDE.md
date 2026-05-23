@@ -145,6 +145,34 @@ runs both inside `tokio::task::spawn_blocking`. **If you refactor
 `fetch_rustdoc_json` and move that work back onto the async path, you
 will silently regress concurrency under load.**
 
+### `fetch_rustdoc_json` is cached; HTML is not
+
+`CachingDocsRsRepository` (`docs_rs/repository/cache.rs`) is a
+decorator wrapped around the real repository by `ServerBuilder` by
+default. It caches successful `FetchRustdocJsonRepositoryOutput`
+values in an in-process LRU+TTL keyed by the requested URL string
+(default: 16 entries, 10-minute TTL, via `moka`). Rationale:
+`search_crate_docs` reliably hits the same `(crate, version)` JSON
+payload across multiple queries in a session, and the per-call cost
+(network + zstd + serde) dwarfs the substring walk. Errors are
+intentionally NOT cached — agents retry expecting fixes, and 404s can
+be transient.
+
+HTML (`fetch_crate_docs`) is pass-through. `get_crate_docs` targets
+a different page per call (low repeat rate), and `search_crate_symbols`
+re-fetches the same `all.html` but pays only a network cost (no parse),
+so HTML caching's value is materially lower. Revisit if `all.html`
+re-fetches appear as a real cost in traces.
+
+Disable from the CLI with `--docs-rs-cache=false` (env
+`MCP_DOCS_RS_CACHE=false`). Disable in a builder via
+`.docs_rs_cache_enabled(false)` — required for any wiremock-driven
+integration test that asserts exact `.expect(N)` upstream call counts
+against the JSON endpoint, since the cache would silently swallow
+repeat fetches. `tests/search_crate_docs.rs` does this for its
+existing tests and exercises the cache itself in a single dedicated
+test.
+
 ## Testing model
 
 Four physically separate test surfaces, each closing a different gap:

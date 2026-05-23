@@ -52,7 +52,10 @@ fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
 #[tokio::test]
 async fn list_tools_advertises_search_crate_docs() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     let tools = client.list_all_tools().await?;
@@ -78,7 +81,10 @@ async fn search_crate_docs_returns_hits_with_snippet() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     // "error" is a near-certain match in the anyhow docs (the crate
@@ -150,7 +156,10 @@ async fn search_crate_docs_filters_by_kind() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -190,7 +199,10 @@ async fn search_crate_docs_rejects_empty_query_with_invalid_request() -> anyhow:
     // No mock mount — an empty query should be rejected before any
     // HTTP call. If we accidentally hit the upstream, wiremock will
     // return 404 by default and the assertion below would catch it.
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -229,7 +241,10 @@ async fn search_crate_docs_reports_404_as_not_found() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -275,7 +290,10 @@ async fn search_crate_docs_reports_format_version_mismatch() -> anyhow::Result<(
         .mount(&mock)
         .await;
 
-    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let server = Server::builder()
+        .docs_rs_base_url(mock.uri())
+        .docs_rs_cache_enabled(false)
+        .build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -332,4 +350,45 @@ fn mutate_format_version(compressed: &[u8], new_value: u32) -> Vec<u8> {
 fn encode_zstd(data: &[u8]) -> Vec<u8> {
     use ruzstd::encoding::{CompressionLevel, compress_to_vec};
     compress_to_vec(data, CompressionLevel::Fastest)
+}
+
+/// End-to-end proof that the rustdoc-JSON cache short-circuits the
+/// second call. Uses `.expect(1)` on the wiremock mount: if the cache
+/// silently regresses to pass-through, the wiremock teardown would fail
+/// with "expected 1, got 2". Cache is left at its default (enabled).
+#[tokio::test]
+async fn second_search_crate_docs_call_is_served_from_cache() -> anyhow::Result<()> {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/crate/anyhow/latest/json.zst"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ANYHOW_JSON_ZST.to_vec(), "application/zstd"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // Cache enabled — that's what we're testing.
+    let server = Server::builder().docs_rs_base_url(mock.uri()).build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    for query in ["error", "Result"] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                    "crate_name": "anyhow",
+                    "query": query,
+                    "limit": 1,
+                }))),
+            )
+            .await?;
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "tool returned error for query {query:?}: {result:?}",
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
 }

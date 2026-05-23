@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::Server;
 use crate::crates_io::repository::{CratesIoRepository, CratesIoRepositoryImpl};
 use crate::crates_io::use_case::CratesIoUseCase;
-use crate::docs_rs::repository::{DocsRsRepository, DocsRsRepositoryImpl};
+use crate::docs_rs::repository::{CachingDocsRsRepository, DocsRsRepository, DocsRsRepositoryImpl};
 use crate::docs_rs::use_case::DocsRsUseCase;
 use crate::error::Error;
 
@@ -37,6 +37,7 @@ pub struct ServerBuilder {
     http: Option<reqwest::Client>,
     crates_io_repository: Option<Arc<dyn CratesIoRepository>>,
     docs_rs_repository: Option<Arc<dyn DocsRsRepository>>,
+    docs_rs_cache_enabled: bool,
 }
 
 impl Default for ServerBuilder {
@@ -48,6 +49,7 @@ impl Default for ServerBuilder {
             http: None,
             crates_io_repository: None,
             docs_rs_repository: None,
+            docs_rs_cache_enabled: true,
         }
     }
 }
@@ -93,9 +95,24 @@ impl ServerBuilder {
     }
 
     /// Inject a fully-formed docs.rs repository. Same caveats as
-    /// [`crates_io_repository`](Self::crates_io_repository).
+    /// [`crates_io_repository`](Self::crates_io_repository). When the
+    /// docs.rs cache is enabled (the default), the injected repository
+    /// is still wrapped — pass `false` to
+    /// [`docs_rs_cache_enabled`](Self::docs_rs_cache_enabled) for tests
+    /// that need exact upstream call counts.
     pub fn docs_rs_repository(mut self, repository: Arc<dyn DocsRsRepository>) -> Self {
         self.docs_rs_repository = Some(repository);
+        self
+    }
+
+    /// Toggle the in-process rustdoc-JSON cache. Default: on. Tests
+    /// that assert exact upstream invocation counts against wiremock
+    /// should disable it so a cache hit doesn't silently swallow a
+    /// would-be second request. See
+    /// [`CachingDocsRsRepository`][crate::docs_rs::repository::CachingDocsRsRepository]
+    /// for what the cache covers and why HTML is not cached.
+    pub fn docs_rs_cache_enabled(mut self, enabled: bool) -> Self {
+        self.docs_rs_cache_enabled = enabled;
         self
     }
 
@@ -135,6 +152,11 @@ impl ServerBuilder {
         let docs_rs_repository: Arc<dyn DocsRsRepository> = match self.docs_rs_repository {
             Some(repository) => repository,
             None => Arc::new(DocsRsRepositoryImpl::new(get_http()?)),
+        };
+        let docs_rs_repository: Arc<dyn DocsRsRepository> = if self.docs_rs_cache_enabled {
+            Arc::new(CachingDocsRsRepository::new(docs_rs_repository))
+        } else {
+            docs_rs_repository
         };
 
         let crates_io_use_case = Arc::new(CratesIoUseCase::new(crates_io_repository));

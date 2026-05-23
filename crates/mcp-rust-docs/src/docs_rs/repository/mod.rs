@@ -1,3 +1,5 @@
+/// In-process LRU+TTL cache wrapping another [`DocsRsRepository`].
+pub mod cache;
 /// Per-error-variant docs for repository failures.
 pub mod error;
 /// Input types accepted by the repository.
@@ -8,6 +10,10 @@ pub mod output;
 use std::io::Read;
 use std::sync::Arc;
 
+pub use self::cache::{
+    CachingDocsRsRepository, CachingDocsRsRepositoryConfig, DEFAULT_RUSTDOC_CACHE_CAPACITY,
+    DEFAULT_RUSTDOC_CACHE_TTL,
+};
 pub use self::error::DocsRsRepositoryError;
 pub use self::input::{FetchCrateDocsRepositoryInput, FetchRustdocJsonRepositoryInput};
 pub use self::output::{FetchCrateDocsRepositoryOutput, FetchRustdocJsonRepositoryOutput};

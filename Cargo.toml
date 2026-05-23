@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6"
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 rustdoc-types = "0.57"
+moka = { version = "0.12", features = ["future"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -41,6 +41,20 @@ struct Cli {
     )]
     docs_rs_base_url: String,
 
+    /// In-process cache for rustdoc-JSON responses fetched from
+    /// docs.rs. On by default; disable with `--docs-rs-cache=false`
+    /// (or `MCP_DOCS_RS_CACHE=false`) when running against a
+    /// fixture-driven upstream that you want every call to hit, or
+    /// when memory pressure outweighs the repeat-fetch cost.
+    #[arg(
+        long,
+        env = "MCP_DOCS_RS_CACHE",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        global = true,
+    )]
+    docs_rs_cache: bool,
+
     #[command(subcommand)]
     transport: Transport,
 }
@@ -71,9 +85,22 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.transport {
-        Transport::Stdio => run_stdio(&cli.crates_io_base_url, &cli.docs_rs_base_url).await,
+        Transport::Stdio => {
+            run_stdio(
+                &cli.crates_io_base_url,
+                &cli.docs_rs_base_url,
+                cli.docs_rs_cache,
+            )
+            .await
+        }
         Transport::Http(args) => {
-            run_http(&cli.crates_io_base_url, &cli.docs_rs_base_url, &args.bind).await
+            run_http(
+                &cli.crates_io_base_url,
+                &cli.docs_rs_base_url,
+                cli.docs_rs_cache,
+                &args.bind,
+            )
+            .await
         }
     }
 }
@@ -102,18 +129,24 @@ fn init_http_tracing() {
         .init();
 }
 
-async fn run_stdio(crates_io_base_url: &str, docs_rs_base_url: &str) -> anyhow::Result<()> {
+async fn run_stdio(
+    crates_io_base_url: &str,
+    docs_rs_base_url: &str,
+    docs_rs_cache: bool,
+) -> anyhow::Result<()> {
     init_stdio_tracing();
 
     tracing::info!(
         %crates_io_base_url,
         %docs_rs_base_url,
+        %docs_rs_cache,
         "starting mcp-rust-docs over stdio",
     );
 
     let server = Server::builder()
         .crates_io_base_url(crates_io_base_url.to_string())
         .docs_rs_base_url(docs_rs_base_url.to_string())
+        .docs_rs_cache_enabled(docs_rs_cache)
         .build()?;
 
     let service = server.serve(stdio()).await.inspect_err(|err| {
@@ -127,6 +160,7 @@ async fn run_stdio(crates_io_base_url: &str, docs_rs_base_url: &str) -> anyhow::
 async fn run_http(
     crates_io_base_url: &str,
     docs_rs_base_url: &str,
+    docs_rs_cache: bool,
     bind_address: &str,
 ) -> anyhow::Result<()> {
     init_http_tracing();
@@ -142,6 +176,7 @@ async fn run_http(
     let server_template = Server::builder()
         .crates_io_base_url(crates_io_base_url.to_string())
         .docs_rs_base_url(docs_rs_base_url.to_string())
+        .docs_rs_cache_enabled(docs_rs_cache)
         .build()?;
 
     let service = StreamableHttpService::new(
@@ -156,6 +191,7 @@ async fn run_http(
         %bind_address,
         %crates_io_base_url,
         %docs_rs_base_url,
+        %docs_rs_cache,
         "mcp-rust-docs listening at /mcp",
     );
 
