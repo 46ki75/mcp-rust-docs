@@ -21,6 +21,8 @@ schemars = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
