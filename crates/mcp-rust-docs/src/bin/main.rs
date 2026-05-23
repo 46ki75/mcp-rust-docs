@@ -132,17 +132,20 @@ async fn run_http(
     init_http_tracing();
 
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let crates_io = crates_io_base_url.to_string();
-    let docs_rs = docs_rs_base_url.to_string();
+
+    // Build the Server (and its `reqwest::Client`) ONCE, then clone
+    // into the per-session factory closure. Server is cheap to clone
+    // (use cases are behind `Arc`s), so every session reuses the same
+    // HTTP client and connection pool. Calling `Server::builder().build()`
+    // inside the factory instead would spin up a fresh client per
+    // session and waste the connection pool.
+    let server_template = Server::builder()
+        .crates_io_base_url(crates_io_base_url.to_string())
+        .docs_rs_base_url(docs_rs_base_url.to_string())
+        .build()?;
 
     let service = StreamableHttpService::new(
-        move || {
-            Server::builder()
-                .crates_io_base_url(crates_io.clone())
-                .docs_rs_base_url(docs_rs.clone())
-                .build()
-                .map_err(std::io::Error::other)
-        },
+        move || Ok(server_template.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_cancellation_token(cancellation.child_token()),
     );

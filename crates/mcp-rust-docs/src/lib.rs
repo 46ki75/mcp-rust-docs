@@ -122,3 +122,49 @@ impl ServerHandler for Server {
         info
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cloning a [`Server`] MUST share its use case `Arc`s with the
+    /// source. The streamable-HTTP transport relies on this: its
+    /// per-session factory closure hands out a fresh `Server` per
+    /// session by cloning a pre-built template, so all sessions share
+    /// the underlying `reqwest::Client` (and its connection pool). If
+    /// this invariant breaks, every HTTP session would silently start
+    /// paying for a fresh client and pool.
+    #[test]
+    fn cloning_server_shares_use_case_arcs() {
+        let server = Server::new().expect("server should build");
+        let clone = server.clone();
+        assert!(
+            Arc::ptr_eq(&server.crates_io_use_case, &clone.crates_io_use_case),
+            "crates_io_use_case must be shared between clones",
+        );
+        assert!(
+            Arc::ptr_eq(&server.docs_rs_use_case, &clone.docs_rs_use_case),
+            "docs_rs_use_case must be shared between clones",
+        );
+    }
+
+    /// Building a fresh [`Server`] via the builder allocates a new
+    /// `reqwest::Client` and fresh use case `Arc`s. This documents the
+    /// wasteful pattern the HTTP session factory MUST NOT use — calling
+    /// `Server::builder().build()` per session would spin up an
+    /// independent connection pool every time, defeating Keep-Alive
+    /// across requests within a session burst.
+    #[test]
+    fn rebuilding_server_via_builder_creates_independent_state() {
+        let first = Server::new().expect("first server should build");
+        let second = Server::new().expect("second server should build");
+        assert!(
+            !Arc::ptr_eq(&first.crates_io_use_case, &second.crates_io_use_case),
+            "Server::new must produce independent state per call",
+        );
+        assert!(
+            !Arc::ptr_eq(&first.docs_rs_use_case, &second.docs_rs_use_case),
+            "Server::new must produce independent state per call",
+        );
+    }
+}
