@@ -2,9 +2,10 @@ pub mod error;
 pub mod input;
 pub mod output;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -12,12 +13,15 @@ pub use self::error::CratesIoRepositoryError;
 pub use self::input::SearchCratesRepositoryInput;
 pub use self::output::{RepositoryCrateRecord, SearchCratesRepositoryOutput};
 
-#[async_trait]
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub type SearchCratesResult = Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>;
+
 pub trait CratesIoRepository: Send + Sync + 'static {
-    async fn search_crates(
+    fn search_crates(
         &self,
         input: SearchCratesRepositoryInput,
-    ) -> Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>;
+    ) -> BoxFuture<'_, SearchCratesResult>;
 }
 
 pub struct CratesIoRepositoryImpl {
@@ -34,55 +38,56 @@ impl CratesIoRepositoryImpl {
     }
 }
 
-#[async_trait]
 impl CratesIoRepository for CratesIoRepositoryImpl {
-    async fn search_crates(
+    fn search_crates(
         &self,
         input: SearchCratesRepositoryInput,
-    ) -> Result<SearchCratesRepositoryOutput, CratesIoRepositoryError> {
-        let url = format!("{}/api/v1/crates", self.base_url);
-        let per_page = input.per_page.to_string();
-        let page = input.page.to_string();
+    ) -> BoxFuture<'_, SearchCratesResult> {
+        Box::pin(async move {
+            let url = format!("{}/api/v1/crates", self.base_url);
+            let per_page = input.per_page.to_string();
+            let page = input.page.to_string();
 
-        let response = self
-            .http
-            .get(&url)
-            .query(&[
-                ("q", input.query.as_str()),
-                ("per_page", per_page.as_str()),
-                ("page", page.as_str()),
-            ])
-            .send()
-            .await?;
+            let response = self
+                .http
+                .get(&url)
+                .query(&[
+                    ("q", input.query.as_str()),
+                    ("per_page", per_page.as_str()),
+                    ("page", page.as_str()),
+                ])
+                .send()
+                .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(CratesIoRepositoryError::UpstreamStatus { status, body });
-        }
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(CratesIoRepositoryError::UpstreamStatus { status, body });
+            }
 
-        let body_bytes = response.bytes().await?;
-        let parsed: CratesIoSearchResponse = serde_json::from_slice(&body_bytes)
-            .map_err(CratesIoRepositoryError::InvalidResponse)?;
+            let body_bytes = response.bytes().await?;
+            let parsed: CratesIoSearchResponse = serde_json::from_slice(&body_bytes)
+                .map_err(CratesIoRepositoryError::InvalidResponse)?;
 
-        Ok(SearchCratesRepositoryOutput {
-            total: parsed.meta.total,
-            crates: parsed
-                .crates
-                .into_iter()
-                .map(|c| RepositoryCrateRecord {
-                    name: c.name,
-                    max_version: c.max_version,
-                    max_stable_version: c.max_stable_version,
-                    description: c.description,
-                    downloads: c.downloads,
-                    recent_downloads: c.recent_downloads,
-                    documentation: c.documentation,
-                    homepage: c.homepage,
-                    repository: c.repository,
-                    updated_at: c.updated_at,
-                })
-                .collect(),
+            Ok(SearchCratesRepositoryOutput {
+                total: parsed.meta.total,
+                crates: parsed
+                    .crates
+                    .into_iter()
+                    .map(|c| RepositoryCrateRecord {
+                        name: c.name,
+                        max_version: c.max_version,
+                        max_stable_version: c.max_stable_version,
+                        description: c.description,
+                        downloads: c.downloads,
+                        recent_downloads: c.recent_downloads,
+                        documentation: c.documentation,
+                        homepage: c.homepage,
+                        repository: c.repository,
+                        updated_at: c.updated_at,
+                    })
+                    .collect(),
+            })
         })
     }
 }
@@ -120,7 +125,7 @@ struct CratesIoMeta {
 
 #[derive(Default)]
 pub struct CratesIoRepositoryStub {
-    queue: Mutex<Vec<Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>>>,
+    queue: Mutex<Vec<SearchCratesResult>>,
 }
 
 impl CratesIoRepositoryStub {
@@ -128,24 +133,22 @@ impl CratesIoRepositoryStub {
         Self::default()
     }
 
-    pub async fn enqueue(
-        &self,
-        result: Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>,
-    ) {
+    pub async fn enqueue(&self, result: SearchCratesResult) {
         self.queue.lock().await.push(result);
     }
 }
 
-#[async_trait]
 impl CratesIoRepository for CratesIoRepositoryStub {
-    async fn search_crates(
+    fn search_crates(
         &self,
         _input: SearchCratesRepositoryInput,
-    ) -> Result<SearchCratesRepositoryOutput, CratesIoRepositoryError> {
-        self.queue.lock().await.pop().unwrap_or_else(|| {
-            Ok(SearchCratesRepositoryOutput {
-                total: 0,
-                crates: vec![],
+    ) -> BoxFuture<'_, SearchCratesResult> {
+        Box::pin(async move {
+            self.queue.lock().await.pop().unwrap_or_else(|| {
+                Ok(SearchCratesRepositoryOutput {
+                    total: 0,
+                    crates: vec![],
+                })
             })
         })
     }
