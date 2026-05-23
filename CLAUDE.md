@@ -5,16 +5,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 An MCP (Model Context Protocol) server written in Rust on top of the
-`rmcp` SDK. Currently exposes one tool, `search_crates`, that queries
-crates.io. The crate ships as a single binary, `mcp-rust-docs`, with
-two transport subcommands:
+`rmcp` SDK. Exposes four tools:
+
+- `search_crates` — crates.io registry search.
+- `get_crate_docs` — docs.rs HTML → Markdown for one page.
+- `search_crate_symbols` — name-based symbol index from rustdoc `all.html`.
+- `grep_crate_docs` — full-text grep over doc comments via docs.rs's
+  zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json.zst`).
+
+The crate ships as a single binary, `mcp-rust-docs`, with two transport
+subcommands:
 
 - `mcp-rust-docs stdio` — line-buffered JSON-RPC over stdin/stdout
 - `mcp-rust-docs http` — streamable HTTP, mounted at `/mcp`
 
-Both accept `--crates-io-base-url` (env `MCP_CRATES_IO_BASE_URL`)
-to point at a wiremock fixture or registry mirror. The HTTP subcommand
-accepts `--bind` (env `MCP_BIND_ADDRESS`, default `127.0.0.1:8000`).
+Both accept `--crates-io-base-url` (env `MCP_CRATES_IO_BASE_URL`) and
+`--docs-rs-base-url` (env `MCP_DOCS_RS_BASE_URL`) to point at wiremock
+fixtures or registry mirrors. The HTTP subcommand accepts `--bind` (env
+`MCP_BIND_ADDRESS`, default `127.0.0.1:8000`).
 
 ## Commands
 
@@ -90,14 +98,65 @@ while `ServerHandler` is implemented in `lib.rs` via
 `ToolRouter<Server>` field. This is the pattern to follow when adding
 a second tool module.
 
+### docs.rs has two distinct endpoint families — don't confuse them
+
+| Tool | URL shape | Repository method |
+| ---- | --------- | ----------------- |
+| `get_crate_docs`, `search_crate_symbols` | `{base}/{crate}/{version}/{lib_name}/...` (HTML, hyphen→underscore on lib_name) | `fetch_crate_docs` |
+| `grep_crate_docs` | `{base}/crate/{crate}/{version}/json.zst` (zstd-compressed rustdoc JSON, NO lib_name segment, NO hyphen translation) | `fetch_rustdoc_json` |
+
+The leading `/crate/` segment and the absence of the lib-name path are
+the easy-to-miss differences. `build_url` (HTML) and
+`build_rustdoc_json_url` (JSON) are kept separate for exactly this
+reason — don't try to unify them.
+
+### `rustdoc-types` format_version pinning
+
+The repository validates `crate_json.format_version` against
+`rustdoc_types::FORMAT_VERSION` after deserialization and returns a
+dedicated `FormatVersionMismatch` error variant on skew. **This is
+intentional — fail loudly, don't try to be tolerant.** When
+`rustdoc-types` bumps its format version in a way that doesn't match
+what docs.rs serves, callers need to know which side is stale.
+
+When refreshing the test fixture
+(`crates/mcp-rust-docs/tests/fixtures/anyhow_rustdoc.json.zst`), pull
+the latest from `https://docs.rs/crate/anyhow/latest/json.zst` after
+bumping `rustdoc-types` — both the inline unit test (in
+`src/docs_rs/use_case/mod.rs`) and the integration test
+(`tests/grep_crate_docs.rs`) share the same file via different relative
+paths, so the path itself must stay stable.
+
+### `ruzstd` (pure Rust), not `zstd` (libzstd C binding)
+
+Chosen deliberately: `ruzstd` 0.8+ has both decoder *and* encoder, so
+the format-version-mismatch test can recompress a mutated fixture
+without pulling in a C dep. Don't switch to the `zstd` crate without a
+concrete reason — the C binding adds a build-system surface for
+marginal speed gain on payloads that already decompress in single-digit
+ms.
+
+### CPU-bound work goes through `spawn_blocking`
+
+zstd decompression + `serde_json::from_slice` of a multi-MB rustdoc
+JSON would block a tokio runtime worker for tens of ms — long enough to
+stall other in-flight requests on the HTTP transport. The repository
+runs both inside `tokio::task::spawn_blocking`. **If you refactor
+`fetch_rustdoc_json` and move that work back onto the async path, you
+will silently regress concurrency under load.**
+
 ## Testing model
 
 Four physically separate test surfaces, each closing a different gap:
 
-1. **Unit tests** — `#[cfg(test)] mod tests` inside `src/`. Currently
-   only `crates_io/use_case/mod.rs`. Uses `CratesIoRepositoryStub`,
-   which is `#[cfg(test)] pub(crate)` in `crates_io/repository/mod.rs`
-   — invisible to release builds and integration tests.
+1. **Unit tests** — `#[cfg(test)] mod tests` inside `src/`. Lives in
+   `crates_io/use_case/mod.rs` and `docs_rs/use_case/mod.rs`. Each uses
+   a sibling stub (`CratesIoRepositoryStub` / `DocsRsRepositoryStub`)
+   that is `#[cfg(test)] pub(crate)` in the matching `repository/mod.rs`
+   — invisible to release builds and integration tests. The docs.rs
+   stub exposes paired enqueue methods (`enqueue` for HTML,
+   `enqueue_json` for rustdoc JSON) so both repository trait methods
+   can be exercised.
 2. **`tests/search_crates.rs`** — in-process duplex pipe
    (`tokio::io::duplex`) + wiremock. Fastest; isolates protocol/handler
    logic from real I/O.
