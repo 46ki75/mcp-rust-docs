@@ -21,7 +21,13 @@ use crate::Server;
 #[tool_router(router = crates_io_tool_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Search crates on crates.io. Returns name, version, description, download counts and links for each matched crate."
+        description = "Search crates on crates.io. Returns name, version, description, download counts and links for each matched crate.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     pub(crate) async fn search_crates(
         &self,

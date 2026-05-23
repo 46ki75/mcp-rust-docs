@@ -21,7 +21,13 @@ use crate::Server;
 #[tool_router(router = docs_rs_tool_router, vis = "pub(crate)")]
 impl Server {
     #[tool(
-        description = "Fetch a Rust documentation page from docs.rs and return it as Markdown. Use `crate_name` (required), `version` (optional, defaults to `latest`), and `path` (optional URL tail under the crate's docs root, e.g. `task/struct.JoinHandle.html` or `sync/index.html`)."
+        description = "Fetch a Rust documentation page from docs.rs and return it as Markdown. Use `crate_name` (required), `version` (optional, defaults to `latest`), and `path` (optional URL tail under the crate's docs root, e.g. `task/struct.JoinHandle.html` or `sync/index.html`).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     pub(crate) async fn get_crate_docs(
         &self,
@@ -44,7 +50,13 @@ impl Server {
     }
 
     #[tool(
-        description = "Search a Rust crate's public symbols (types, traits, functions, macros, modules, etc.) by name. Returns matched items with their kind, qualified name and the `path` argument that `get_crate_docs` accepts. `query` is a case-insensitive substring match against the qualified name; omit it to list everything. `kinds` filters by kind (`struct`, `enum`, `trait`, `fn`, `macro`, `derive`, `attribute`, `type`, `module`, `constant`, `static`, `union`, `primitive`). `limit` caps results (default 50, max 500)."
+        description = "Search a Rust crate's public symbols (types, traits, functions, macros, modules, etc.) by name. Returns matched items with their kind, qualified name and the `path` argument that `get_crate_docs` accepts. `query` is a case-insensitive substring match against the qualified name; omit it to list everything. `kinds` filters by kind (`struct`, `enum`, `trait`, `fn`, `macro`, `derive`, `attribute`, `type`, `module`, `constant`, `static`, `union`, `primitive`). `limit` caps results (default 50, max 500).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     pub(crate) async fn search_crate_symbols(
         &self,
