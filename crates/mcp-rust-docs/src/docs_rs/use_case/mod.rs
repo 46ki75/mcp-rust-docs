@@ -250,6 +250,15 @@ impl DocsRsUseCase {
                 Some(s) => s,
                 None => continue,
             };
+            // `crate_id == 0` is the local crate; anything else is an
+            // entry for a foreign item (typically reached via re-export
+            // or intra-doc reference). Their URL path is relative to a
+            // *different* crate's docs root, so emitting them here would
+            // produce a 404 when the caller hands the path back to
+            // `get_crate_docs`.
+            if summary.crate_id != 0 {
+                continue;
+            }
             let (kind, path) = match rustdoc_kind_and_path(summary) {
                 Some(parts) => parts,
                 None => continue,
@@ -1898,6 +1907,110 @@ mod tests {
                 hit.snippet,
             );
         }
+        Ok(())
+    }
+
+    /// `crate_json.index` can contain external-crate items (e.g.
+    /// re-exports) whose `ItemSummary::crate_id != 0`. Their `path`
+    /// resolves under a *different* crate's docs root, so emitting them
+    /// in `search_crate_docs` results would hand the caller a URL that
+    /// 404s when fed back to `get_crate_docs`. This test pins the
+    /// guard: with `crate_id = 1` the item is filtered; flip it to `0`
+    /// and the same item flows through, proving the test isn't passing
+    /// for an unrelated reason.
+    #[tokio::test]
+    async fn search_crate_docs_filters_foreign_crate_items() -> anyhow::Result<()> {
+        const SENTINEL: &str = "qqzzqq_unique_search_token";
+        let synthetic_id = rustdoc_types::Id(9_900_001);
+
+        let make_crate = |summary_crate_id: u32| -> Arc<rustdoc_types::Crate> {
+            let mut c = rustdoc_types::Crate {
+                root: rustdoc_types::Id(0),
+                crate_version: None,
+                includes_private: false,
+                index: Default::default(),
+                paths: Default::default(),
+                external_crates: Default::default(),
+                target: rustdoc_types::Target {
+                    triple: "x86_64-unknown-linux-gnu".into(),
+                    target_features: Vec::new(),
+                },
+                format_version: rustdoc_types::FORMAT_VERSION,
+            };
+            c.index.insert(
+                synthetic_id,
+                rustdoc_types::Item {
+                    id: synthetic_id,
+                    crate_id: summary_crate_id,
+                    name: Some("ForeignThing".into()),
+                    span: None,
+                    visibility: rustdoc_types::Visibility::Public,
+                    docs: Some(format!("This struct mentions {SENTINEL} for the test.")),
+                    links: Default::default(),
+                    attrs: Vec::new(),
+                    deprecation: None,
+                    // `ExternType` is a unit variant — saves us from
+                    // constructing a real `Struct`. The use case reads
+                    // only `item.docs` / `item.name` from the index;
+                    // kind comes from the summary below.
+                    inner: rustdoc_types::ItemEnum::ExternType,
+                },
+            );
+            c.paths.insert(
+                synthetic_id,
+                rustdoc_types::ItemSummary {
+                    crate_id: summary_crate_id,
+                    path: vec!["other_crate".into(), "ForeignThing".into()],
+                    kind: rustdoc_types::ItemKind::Struct,
+                },
+            );
+            Arc::new(c)
+        };
+
+        // Phase 1: foreign item (crate_id = 1) — must be filtered out.
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
+            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            crate_json: make_crate(1),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+        let out = use_case
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: None,
+                query: SENTINEL.into(),
+                kinds: None,
+                limit: None,
+            })
+            .await?;
+        assert_eq!(
+            out.total_matched, 0,
+            "foreign-crate item leaked into results: {:?}",
+            out.items,
+        );
+
+        // Phase 2: same item, crate_id = 0 — must flow through. Proves
+        // phase 1's zero count is the filter firing, not a broken stub
+        // / broken walk.
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
+            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            crate_json: make_crate(0),
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+        let out = use_case
+            .search_crate_docs(SearchCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: None,
+                query: SENTINEL.into(),
+                kinds: None,
+                limit: None,
+            })
+            .await?;
+        assert_eq!(out.total_matched, 1);
+        assert_eq!(out.items[0].name, "ForeignThing");
         Ok(())
     }
 

@@ -54,10 +54,12 @@ pub enum DocsRsRepositoryError {
         source: std::io::Error,
     },
 
-    /// The decompressed payload was not valid rustdoc JSON, or used a
-    /// `format_version` `rustdoc-types` doesn't model. Both surfaces
-    /// the same `serde_json` error since `rustdoc-types`' deserializer
-    /// reports format-version mismatches through the same channel.
+    /// The decompressed payload couldn't be deserialized by
+    /// `rustdoc-types` — malformed JSON, missing required fields, or a
+    /// shape `rustdoc-types` doesn't model. A `format_version` skew
+    /// against `rustdoc_types::FORMAT_VERSION` is caught *after*
+    /// successful deserialization and surfaces through
+    /// [`Self::FormatVersionMismatch`], not this variant.
     #[error("failed to parse rustdoc JSON from {url}: {source}")]
     InvalidRustdocJson {
         /// URL whose payload failed to parse.
