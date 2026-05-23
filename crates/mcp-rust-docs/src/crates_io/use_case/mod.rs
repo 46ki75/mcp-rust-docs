@@ -1,5 +1,8 @@
+/// Use case error type.
 pub mod error;
+/// Use case input types.
 pub mod input;
+/// Use case output types.
 pub mod output;
 
 use std::sync::Arc;
@@ -17,15 +20,29 @@ const DEFAULT_PER_PAGE: u8 = 10;
 const MAX_PER_PAGE: u8 = 100;
 const DEFAULT_PAGE: u32 = 1;
 
+/// Use case for searching crates on crates.io.
+///
+/// Holds the repository behind `Arc<dyn>` so production wiring and
+/// stub-backed unit tests share the same code path. All input
+/// validation and policy (defaults, clamping, stable-version
+/// preference) lives here — the repository is dumb I/O and the tool
+/// layer is dumb DTO translation.
 pub struct CratesIoUseCase {
     repository: Arc<dyn CratesIoRepository>,
 }
 
 impl CratesIoUseCase {
+    /// Build a use case backed by the given repository.
     pub fn new(repository: Arc<dyn CratesIoRepository>) -> Self {
         Self { repository }
     }
 
+    /// Validate, default-and-clamp the input, then issue a search
+    /// against the underlying repository.
+    ///
+    /// Whitespace-only queries are rejected as
+    /// [`CratesIoUseCaseError::InvalidQuery`]; otherwise repository
+    /// failures bubble through [`CratesIoUseCaseError::Repository`].
     #[tracing::instrument(skip(self))]
     pub async fn search_crates(
         &self,

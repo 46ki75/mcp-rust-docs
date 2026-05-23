@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::crates_io::use_case::SearchCratesUseCaseInput;
 
+/// Arguments for the `search_crates` tool.
+///
+/// Field docs double as the JSON Schema descriptions surfaced to the
+/// MCP client (and therefore to the model) via `schemars`.
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchCratesRequest {
     /// Search query. Matches against crate name, description and keywords.

@@ -1,5 +1,8 @@
+/// Tool-layer error type and its formatting into [`CallToolResult`].
 pub mod error;
+/// JSON-Schema-derived request types accepted by the MCP tools.
 pub mod request;
+/// Serializable response types returned in tool output.
 pub mod response;
 
 pub use self::error::CratesIoToolError;

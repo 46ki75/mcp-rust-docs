@@ -1,5 +1,8 @@
+/// Per-error-variant docs for repository failures.
 pub mod error;
+/// Input types accepted by the repository.
 pub mod input;
+/// Output types returned by the repository.
 pub mod output;
 
 use std::future::Future;
@@ -12,23 +15,39 @@ pub use self::error::CratesIoRepositoryError;
 pub use self::input::SearchCratesRepositoryInput;
 pub use self::output::{RepositoryCrateRecord, SearchCratesRepositoryOutput};
 
+/// Boxed future used to keep the repository trait dyn-compatible.
+///
+/// See the org standards' _Async traits with `Arc<dyn>`_ section for
+/// why we hand-roll this instead of using `#[async_trait]`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Convenience alias for the repository's only result shape.
 pub type SearchCratesResult = Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>;
 
+/// Repository abstraction over the crates.io search endpoint.
+///
+/// Held as `Arc<dyn CratesIoRepository>` by the use case so a stub
+/// can be swapped in for tests without touching the real HTTP client.
 pub trait CratesIoRepository: Send + Sync + 'static {
+    /// Issue a search and return the registry's response, projected
+    /// onto [`SearchCratesRepositoryOutput`].
     fn search_crates(
         &self,
         input: SearchCratesRepositoryInput,
     ) -> BoxFuture<'_, SearchCratesResult>;
 }
 
+/// Real implementation backed by `reqwest`, talking to crates.io
+/// (or any compatible registry mirror) over HTTPS.
 pub struct CratesIoRepositoryImpl {
     http: reqwest::Client,
     base_url: Arc<str>,
 }
 
 impl CratesIoRepositoryImpl {
+    /// Wrap a pre-built `reqwest::Client` and the base URL of the
+    /// target registry (e.g. `https://crates.io`). The client's
+    /// `User-Agent` header is preserved — set it before passing in.
     pub fn new(http: reqwest::Client, base_url: impl Into<Arc<str>>) -> Self {
         Self {
             http,

@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
-authors = ["Ikuma Yamashita <46ki75@gmail.com>"]
+authors = ["Ikuma Yamashita"]
 repository = "https://github.com/46ki75/mcp-rust-docs"
 
 [workspace.dependencies]
