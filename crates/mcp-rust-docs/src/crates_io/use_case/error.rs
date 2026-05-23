@@ -10,8 +10,9 @@ use crate::crates_io::repository::CratesIoRepositoryError;
 #[derive(Debug, thiserror::Error)]
 pub enum CratesIoUseCaseError {
     /// The request failed validation before any HTTP call was made —
-    /// e.g. empty query.
-    #[error("invalid search query: {0}")]
+    /// e.g. empty query, or a metadata request naming a version that
+    /// doesn't exist on the resolved crate.
+    #[error("invalid request: {0}")]
     InvalidQuery(String),
 
     /// The repository call itself failed; see

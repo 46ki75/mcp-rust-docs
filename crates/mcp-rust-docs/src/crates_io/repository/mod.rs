@@ -12,8 +12,14 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 pub use self::error::CratesIoRepositoryError;
-pub use self::input::SearchCratesRepositoryInput;
-pub use self::output::{RepositoryCrateRecord, SearchCratesRepositoryOutput};
+pub use self::input::{
+    FetchCrateInput, FetchCrateVersionDependenciesInput, SearchCratesRepositoryInput,
+};
+pub use self::output::{
+    FetchCrateRepositoryOutput, FetchCrateVersionDependenciesRepositoryOutput,
+    RepositoryCrateRecord, RepositoryCrateVersion, RepositoryDependency, RepositoryDependencyKind,
+    SearchCratesRepositoryOutput,
+};
 
 /// Boxed future used to keep the repository trait dyn-compatible.
 ///
@@ -21,13 +27,22 @@ pub use self::output::{RepositoryCrateRecord, SearchCratesRepositoryOutput};
 /// why we hand-roll this instead of using `#[async_trait]`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Convenience alias for the repository's only result shape.
+/// Convenience alias for the search endpoint result.
 pub type SearchCratesResult = Result<SearchCratesRepositoryOutput, CratesIoRepositoryError>;
 
-/// Repository abstraction over the crates.io search endpoint.
+/// Convenience alias for the per-crate fetch result.
+pub type FetchCrateResult = Result<FetchCrateRepositoryOutput, CratesIoRepositoryError>;
+
+/// Convenience alias for the dependencies fetch result.
+pub type FetchCrateVersionDependenciesResult =
+    Result<FetchCrateVersionDependenciesRepositoryOutput, CratesIoRepositoryError>;
+
+/// Repository abstraction over the crates.io HTTP API.
 ///
 /// Held as `Arc<dyn CratesIoRepository>` by the use case so a stub
 /// can be swapped in for tests without touching the real HTTP client.
+/// The three methods correspond to the three endpoints we hit:
+/// search, per-crate aggregate, per-version dependencies.
 pub trait CratesIoRepository: Send + Sync + 'static {
     /// Issue a search and return the registry's response, projected
     /// onto [`SearchCratesRepositoryOutput`].
@@ -35,6 +50,19 @@ pub trait CratesIoRepository: Send + Sync + 'static {
         &self,
         input: SearchCratesRepositoryInput,
     ) -> BoxFuture<'_, SearchCratesResult>;
+
+    /// Fetch the aggregate per-crate record: versions list with
+    /// features, `max_version` / `max_stable_version`. 404 surfaces
+    /// as [`CratesIoRepositoryError::NotFound`].
+    fn fetch_crate(&self, input: FetchCrateInput) -> BoxFuture<'_, FetchCrateResult>;
+
+    /// Fetch the dependency list for a specific published version.
+    /// 404 surfaces as [`CratesIoRepositoryError::NotFound`] — either
+    /// the crate or the version is unknown.
+    fn fetch_crate_version_dependencies(
+        &self,
+        input: FetchCrateVersionDependenciesInput,
+    ) -> BoxFuture<'_, FetchCrateVersionDependenciesResult>;
 }
 
 /// Real implementation backed by `reqwest`, talking to crates.io
@@ -77,13 +105,7 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
                 .send()
                 .await?;
 
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(CratesIoRepositoryError::UpstreamStatus { status, url, body });
-            }
-
-            let body_bytes = response.bytes().await?;
+            let body_bytes = check_status_and_read_body(response, &url).await?;
             let parsed: CratesIoSearchResponse = serde_json::from_slice(&body_bytes)
                 .map_err(CratesIoRepositoryError::InvalidResponse)?;
 
@@ -108,6 +130,92 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
             })
         })
     }
+
+    fn fetch_crate(&self, input: FetchCrateInput) -> BoxFuture<'_, FetchCrateResult> {
+        Box::pin(async move {
+            let url = format!("{}/api/v1/crates/{}", self.base_url, input.crate_name);
+            let response = self.http.get(&url).send().await?;
+            let body_bytes = check_status_and_read_body(response, &url).await?;
+            let parsed: CratesIoCrateResponse = serde_json::from_slice(&body_bytes)
+                .map_err(CratesIoRepositoryError::InvalidResponse)?;
+
+            Ok(FetchCrateRepositoryOutput {
+                name: parsed.krate.name,
+                max_version: parsed.krate.max_version,
+                max_stable_version: parsed.krate.max_stable_version,
+                versions: parsed
+                    .versions
+                    .into_iter()
+                    .map(|v| RepositoryCrateVersion {
+                        num: v.num,
+                        yanked: v.yanked,
+                        created_at: v.created_at,
+                        features: v.features,
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    fn fetch_crate_version_dependencies(
+        &self,
+        input: FetchCrateVersionDependenciesInput,
+    ) -> BoxFuture<'_, FetchCrateVersionDependenciesResult> {
+        Box::pin(async move {
+            let url = format!(
+                "{}/api/v1/crates/{}/{}/dependencies",
+                self.base_url, input.crate_name, input.version,
+            );
+            let response = self.http.get(&url).send().await?;
+            let body_bytes = check_status_and_read_body(response, &url).await?;
+            let parsed: CratesIoDependenciesResponse = serde_json::from_slice(&body_bytes)
+                .map_err(CratesIoRepositoryError::InvalidResponse)?;
+
+            Ok(FetchCrateVersionDependenciesRepositoryOutput {
+                dependencies: parsed
+                    .dependencies
+                    .into_iter()
+                    .map(|d| RepositoryDependency {
+                        name: d.crate_id,
+                        req: d.req,
+                        kind: match d.kind.as_str() {
+                            "dev" => RepositoryDependencyKind::Dev,
+                            "build" => RepositoryDependencyKind::Build,
+                            // crates.io uses "normal" but be permissive
+                            // against unknown future kinds — default to
+                            // Normal rather than dropping the dep.
+                            _ => RepositoryDependencyKind::Normal,
+                        },
+                        optional: d.optional,
+                    })
+                    .collect(),
+            })
+        })
+    }
+}
+
+/// Consolidated status check: 404 → `NotFound`, other non-2xx →
+/// `UpstreamStatus` with body, 2xx → return body bytes. Centralised so
+/// the three endpoint impls share identical error routing.
+async fn check_status_and_read_body(
+    response: reqwest::Response,
+    url: &str,
+) -> Result<Vec<u8>, CratesIoRepositoryError> {
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(CratesIoRepositoryError::NotFound {
+            url: url.to_string(),
+        });
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(CratesIoRepositoryError::UpstreamStatus {
+            status,
+            url: url.to_string(),
+            body,
+        });
+    }
+    Ok(response.bytes().await?.to_vec())
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +249,45 @@ struct CratesIoMeta {
     total: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct CratesIoCrateResponse {
+    #[serde(rename = "crate")]
+    krate: CratesIoRawCrateAggregate,
+    versions: Vec<CratesIoRawCrateVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoRawCrateAggregate {
+    name: String,
+    max_version: String,
+    #[serde(default)]
+    max_stable_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoRawCrateVersion {
+    num: String,
+    yanked: bool,
+    created_at: String,
+    #[serde(default)]
+    features: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoDependenciesResponse {
+    dependencies: Vec<CratesIoRawDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoRawDependency {
+    /// crates.io's API field name; despite "id" this is the
+    /// dependency's crate name as a string.
+    crate_id: String,
+    req: String,
+    kind: String,
+    optional: bool,
+}
+
 /// In-memory stub used by unit tests across the crate. Gated on `cfg(test)`
 /// so it never ships in release builds and is invisible to integration
 /// tests in `tests/` — those should exercise the real repository through
@@ -149,6 +296,8 @@ struct CratesIoMeta {
 #[derive(Default)]
 pub(crate) struct CratesIoRepositoryStub {
     queue: tokio::sync::Mutex<Vec<SearchCratesResult>>,
+    crate_queue: tokio::sync::Mutex<Vec<FetchCrateResult>>,
+    deps_queue: tokio::sync::Mutex<Vec<FetchCrateVersionDependenciesResult>>,
 }
 
 #[cfg(test)]
@@ -159,6 +308,14 @@ impl CratesIoRepositoryStub {
 
     pub(crate) async fn enqueue(&self, result: SearchCratesResult) {
         self.queue.lock().await.push(result);
+    }
+
+    pub(crate) async fn enqueue_crate(&self, result: FetchCrateResult) {
+        self.crate_queue.lock().await.push(result);
+    }
+
+    pub(crate) async fn enqueue_dependencies(&self, result: FetchCrateVersionDependenciesResult) {
+        self.deps_queue.lock().await.push(result);
     }
 }
 
@@ -173,6 +330,29 @@ impl CratesIoRepository for CratesIoRepositoryStub {
                 Ok(SearchCratesRepositoryOutput {
                     total: 0,
                     crates: vec![],
+                })
+            })
+        })
+    }
+
+    fn fetch_crate(&self, input: FetchCrateInput) -> BoxFuture<'_, FetchCrateResult> {
+        Box::pin(async move {
+            self.crate_queue.lock().await.pop().unwrap_or_else(|| {
+                Err(CratesIoRepositoryError::NotFound {
+                    url: format!("stub://{}", input.crate_name),
+                })
+            })
+        })
+    }
+
+    fn fetch_crate_version_dependencies(
+        &self,
+        input: FetchCrateVersionDependenciesInput,
+    ) -> BoxFuture<'_, FetchCrateVersionDependenciesResult> {
+        Box::pin(async move {
+            self.deps_queue.lock().await.pop().unwrap_or_else(|| {
+                Err(CratesIoRepositoryError::NotFound {
+                    url: format!("stub://{}/{}", input.crate_name, input.version),
                 })
             })
         })

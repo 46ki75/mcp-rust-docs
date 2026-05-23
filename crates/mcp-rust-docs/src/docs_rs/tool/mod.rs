@@ -8,7 +8,8 @@ pub mod response;
 pub use self::error::DocsRsToolError;
 pub use self::request::{GetCrateDocsRequest, SearchCrateDocsRequest, SearchCrateSymbolsRequest};
 pub use self::response::{
-    DocHitDto, GetCrateDocsResponse, SearchCrateDocsResponse, SearchCrateSymbolsResponse, SymbolDto,
+    CrateVersionDto, DependencyEntryDto, DependencySummaryDto, DocHitDto, GetCrateDocsResponse,
+    MetadataDto, SearchCrateDocsResponse, SearchCrateSymbolsResponse, SymbolDto,
 };
 
 use rmcp::{
@@ -19,6 +20,7 @@ use rmcp::{
 };
 
 use crate::Server;
+use crate::crates_io::use_case::GetCrateMetadataUseCaseInput;
 
 #[tool_router(router = docs_rs_tool_router, vis = "pub(crate)")]
 impl Server {
@@ -35,12 +37,40 @@ impl Server {
         &self,
         Parameters(args): Parameters<GetCrateDocsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let output = match self.docs_rs_use_case().fetch_crate_docs(args.into()).await {
-            Ok(output) => output,
-            Err(err) => return Ok(DocsRsToolError::from(err).into_tool_result()),
-        };
+        // Crate-root calls (no `path`) attach metadata fetched in
+        // parallel with the docs page. Drill-down calls skip the
+        // metadata trip — the agent already has it from the root
+        // call, and re-fetching per page would be wasteful.
+        let want_metadata = args.path.is_none();
+        let crate_name = args.crate_name.clone();
+        let version = args.version.clone();
 
-        let response = GetCrateDocsResponse::from(output);
+        let response = if want_metadata {
+            let docs_fut = self.docs_rs_use_case().fetch_crate_docs(args.into());
+            let metadata_fut =
+                self.crates_io_use_case()
+                    .get_crate_metadata(GetCrateMetadataUseCaseInput {
+                        crate_name,
+                        version,
+                    });
+            let (docs_result, metadata_result) = tokio::join!(docs_fut, metadata_fut);
+
+            let docs_output = match docs_result {
+                Ok(output) => output,
+                Err(err) => return Ok(DocsRsToolError::from(err).into_tool_result()),
+            };
+            // Metadata is best-effort: a crates.io blip must not kill
+            // a successful docs fetch. Format the error so the caller
+            // sees what happened and can decide to retry.
+            let metadata = metadata_result.map_err(|err| err.to_string());
+            GetCrateDocsResponse::from_docs_and_metadata(docs_output, metadata)
+        } else {
+            let docs_output = match self.docs_rs_use_case().fetch_crate_docs(args.into()).await {
+                Ok(output) => output,
+                Err(err) => return Ok(DocsRsToolError::from(err).into_tool_result()),
+            };
+            GetCrateDocsResponse::from_docs_only(docs_output)
+        };
 
         match serde_json::to_string_pretty(&response) {
             Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),

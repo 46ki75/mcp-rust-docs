@@ -318,6 +318,69 @@ async fn live_search_crate_docs_falls_back_through_serde() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Live counterpart to `get_crate_docs_attaches_metadata_on_root_call`.
+/// Confirms the parallel docs+metadata composition works against real
+/// docs.rs and real crates.io for a well-known crate. Looks for shape,
+/// not exact contents — `serde` has stable enough surface that the
+/// `derive` feature and a `serde_derive` runtime dep are safe bets.
+#[tokio::test]
+#[ignore = "live: hits real docs.rs and crates.io"]
+async fn live_get_crate_docs_attaches_real_metadata_for_serde() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "serde" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+
+    let metadata = parsed["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata missing from live response: {parsed}"));
+    assert_eq!(metadata["crate_name"], "serde");
+
+    // Versions list must be non-empty and capped at the documented
+    // limit (or below if serde happens to have fewer total versions).
+    let versions = metadata["versions"].as_array().expect("versions array");
+    assert!(!versions.is_empty(), "expected at least one version");
+    assert!(versions.len() <= 20, "versions list exceeded cap of 20");
+
+    // `derive` is one of serde's signature features — if it's missing
+    // the Cargo.toml `[features]` extraction has broken.
+    let features = metadata["features"].as_object().expect("features object");
+    assert!(
+        features.contains_key("derive"),
+        "expected `derive` feature on serde: {features:?}",
+    );
+
+    // serde at 1.x has at least one runtime dep (`serde_derive`).
+    let deps = metadata["dependencies"].as_object().expect("dependencies");
+    let runtime_count = deps["runtime_count"].as_u64().expect("runtime_count int");
+    assert!(
+        runtime_count >= 1,
+        "expected at least one runtime dep on serde, got: {runtime_count}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {

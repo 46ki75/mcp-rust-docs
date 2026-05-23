@@ -8,7 +8,15 @@ An MCP (Model Context Protocol) server written in Rust on top of the
 `rmcp` SDK. Exposes four tools:
 
 - `search_crates` — crates.io registry search.
-- `get_crate_docs` — docs.rs HTML → Markdown for one page.
+- `get_crate_docs` — docs.rs HTML → Markdown for one page. On
+  *crate-root* calls (no `path`), also bundles a `metadata` block
+  fetched in parallel from crates.io: recent versions (capped at 20),
+  the resolved version's `Cargo.toml` `[features]` map, and a
+  dependency summary (per-kind counts plus the top runtime deps).
+  Drill-down calls skip the metadata fetch — the agent has it from
+  the root call. Metadata is *best-effort*: a crates.io blip
+  populates `metadata_error` but the docs still ship. See *Composite
+  tool: `get_crate_docs`* below.
 - `search_crate_symbols` — name-based symbol index from rustdoc `all.html`.
 - `search_crate_docs` — full-text search over doc comments via docs.rs's
   zstd-compressed rustdoc JSON (`/crate/{name}/{version}/json/{format_version}.zst`).
@@ -221,6 +229,44 @@ against the JSON endpoint, since the cache would silently swallow
 repeat fetches. `tests/search_crate_docs.rs` does this for its
 existing tests and exercises the cache itself in a single dedicated
 test.
+
+### Composite tool: `get_crate_docs`
+
+The only tool that crosses module boundaries. On a *crate-root* call
+(`path` is `None`) the handler runs two use cases in parallel via
+`tokio::join!`:
+
+- `DocsRsUseCase::fetch_crate_docs` — the load-bearing docs fetch.
+- `CratesIoUseCase::get_crate_metadata` — versions, features, deps.
+
+Drill-down calls (`path` set) skip the metadata fetch entirely: the
+agent already has the metadata from the root call, and re-fetching
+per page would be wasted upstream calls. The `.expect(0)` mocks on
+the crates.io routes in `tests/get_crate_docs.rs::get_crate_docs_omits_metadata_when_path_is_set`
+pin this.
+
+**Best-effort merging.** A metadata-only failure populates the
+response's `metadata_error` (the formatted error string) and leaves
+`metadata` absent. The tool result stays *success* — a crates.io
+blip must not kill a successful docs fetch, which is what the agent
+actually came for. A docs-fetch failure, by contrast, still surfaces
+as a tool error.
+
+**The cross-module type leak is contained.** `docs_rs/tool/response.rs`
+imports `CrateMetadata` (and friends) from `crates_io/use_case` to
+build its DTOs. That import is the only place outside `crates_io/`
+that references those types; the use cases themselves remain
+independent. If a second composite tool ever appears, consider
+lifting the DTO conversion into a shared module before letting the
+cross-module imports spread.
+
+**Hermetic-test caveat.** Every test in `tests/get_crate_docs.rs`
+points both `docs_rs_base_url` AND `crates_io_base_url` at the same
+wiremock instance — otherwise the metadata fetch on root calls would
+silently hit real crates.io. Tests that don't care about metadata
+leave the `/api/v1/crates/...` routes unmocked; those requests 404,
+the response carries a populated `metadata_error`, and the docs
+payload still ships.
 
 ## Testing model
 

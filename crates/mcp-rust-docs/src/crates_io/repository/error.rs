@@ -12,8 +12,19 @@ pub enum CratesIoRepositoryError {
     #[error("HTTP request to crates.io failed: {0}")]
     Network(#[from] reqwest::Error),
 
-    /// The registry returned a non-2xx response. Body is captured
-    /// verbatim — may be JSON or plain text.
+    /// The registry returned 404. Broken out from `UpstreamStatus`
+    /// because the use case maps it to a caller-facing "crate or
+    /// version doesn't exist" rather than a generic upstream failure.
+    /// Only meaningful for endpoints that target a single crate (the
+    /// search endpoint never 404s; it returns an empty result set).
+    #[error("crates.io returned 404 for {url}")]
+    NotFound {
+        /// URL that returned 404.
+        url: String,
+    },
+
+    /// The registry returned a non-2xx, non-404 response. Body is
+    /// captured verbatim — may be JSON or plain text.
     #[error("crates.io returned HTTP {status} for {url}: {body}")]
     UpstreamStatus {
         /// HTTP status code returned by the registry.
