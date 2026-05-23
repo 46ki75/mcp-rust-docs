@@ -214,6 +214,63 @@ async fn live_search_crate_symbols_finds_serde_deserialize_trait() -> anyhow::Re
 }
 
 #[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_grep_crate_docs_finds_anyhow_error_mentions() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("grep_crate_docs").with_arguments(args(json!({
+                "crate_name": "anyhow",
+                "query": "error",
+                "limit": 5,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "anyhow");
+    // docs.rs's `/crate/{name}/latest/json.zst` redirects to a
+    // concrete version — the use case should have parsed it out.
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    let total = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "expected at least one hit for `error` in anyhow: {parsed}"
+    );
+    let items = parsed["items"].as_array().expect("items array");
+    assert!(!items.is_empty(), "no items returned: {parsed}");
+    // Every hit must have a non-empty snippet that contains the query.
+    for item in items {
+        let snippet = item["snippet"].as_str().expect("snippet string");
+        assert!(
+            snippet.to_lowercase().contains("error"),
+            "live snippet missing query: {snippet}",
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {
     let server = Server::new()?;

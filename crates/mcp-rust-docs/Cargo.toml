@@ -27,6 +27,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+ruzstd = { workspace = true }
+rustdoc-types = { workspace = true }
 
 [dev-dependencies]
 rmcp = { workspace = true, features = [

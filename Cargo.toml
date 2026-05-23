@@ -40,6 +40,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 wiremock = "0.6"
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+rustdoc-types = "0.57"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

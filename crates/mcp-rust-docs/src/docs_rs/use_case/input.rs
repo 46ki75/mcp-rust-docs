@@ -52,3 +52,31 @@ pub struct SearchCrateSymbolsUseCaseInput {
     /// 50 and clamps to 500 to keep response sizes bounded.
     pub limit: Option<u32>,
 }
+
+/// Pre-validation arguments for the doc-comment full-text search.
+///
+/// Unlike [`SearchCrateSymbolsUseCaseInput`], `query` is required and
+/// non-empty: a "grep" with no pattern would return every item with a
+/// doc comment. The match runs case-insensitively against each item's
+/// rustdoc-JSON `docs` field — i.e. the raw doc comment Markdown, with
+/// intra-doc links and code fences intact.
+#[derive(Debug, Clone)]
+pub struct GrepCrateDocsUseCaseInput {
+    /// Crate name. Same normalisation as
+    /// [`FetchCrateDocsUseCaseInput::crate_name`].
+    pub crate_name: String,
+    /// Optional version selector. `None`/`"latest"` resolve to
+    /// docs.rs's `latest` alias.
+    pub version: Option<String>,
+    /// Required pattern. Case-insensitive substring matched against
+    /// each item's doc-comment body. Empty / whitespace-only is
+    /// rejected.
+    pub query: String,
+    /// Optional kind filter. Use case-insensitive normalised names
+    /// (`struct`, `enum`, `trait`, `fn`, `macro`, `derive`, `module`,
+    /// …). Unknown kinds match nothing; an empty list is treated as
+    /// "no filter".
+    pub kinds: Option<Vec<String>>,
+    /// Optional cap on returned items. Defaults to 20, clamped to 100.
+    pub limit: Option<u32>,
+}

@@ -1,7 +1,8 @@
 use serde::Serialize;
 
 use crate::docs_rs::use_case::{
-    FetchCrateDocsUseCaseOutput, SearchCrateSymbolsUseCaseOutput, SymbolEntry,
+    DocHit, FetchCrateDocsUseCaseOutput, GrepCrateDocsUseCaseOutput,
+    SearchCrateSymbolsUseCaseOutput, SymbolEntry,
 };
 
 /// JSON body returned by the `get_crate_docs` tool.
@@ -93,6 +94,68 @@ impl From<SymbolEntry> for SymbolDto {
             kind: entry.kind,
             name: entry.name,
             path: entry.path,
+        }
+    }
+}
+
+/// JSON body returned by the `grep_crate_docs` tool. Mirrors
+/// [`SearchCrateSymbolsResponse`] shape with an extra `snippet` on
+/// each hit.
+#[derive(Debug, Serialize)]
+pub struct GrepCrateDocsResponse {
+    /// Crate name as requested.
+    pub crate_name: String,
+
+    /// Concrete version docs.rs served the JSON from. Omitted from
+    /// JSON when the URL shape didn't match `/crate/{name}/{version}/...`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_version: Option<String>,
+
+    /// Total items matching the filters before truncation.
+    pub total_matched: usize,
+
+    /// `true` when more items matched than were returned.
+    pub truncated: bool,
+
+    /// Matched items, ranked by name-match bonus, hit count, then
+    /// qualified name.
+    pub items: Vec<DocHitDto>,
+}
+
+/// Wire representation of a single doc-comment match.
+#[derive(Debug, Serialize)]
+pub struct DocHitDto {
+    /// Normalised rustdoc kind.
+    pub kind: String,
+    /// Fully-qualified item name as rustdoc renders it.
+    pub name: String,
+    /// URL-path tail under the crate's docs root. Pass to
+    /// `get_crate_docs.path` to read the full docs.
+    pub path: String,
+    /// Short excerpt centered on the first match, with `…` markers
+    /// when truncated.
+    pub snippet: String,
+}
+
+impl From<GrepCrateDocsUseCaseOutput> for GrepCrateDocsResponse {
+    fn from(output: GrepCrateDocsUseCaseOutput) -> Self {
+        Self {
+            crate_name: output.crate_name,
+            resolved_version: output.resolved_version,
+            total_matched: output.total_matched,
+            truncated: output.truncated,
+            items: output.items.into_iter().map(DocHitDto::from).collect(),
+        }
+    }
+}
+
+impl From<DocHit> for DocHitDto {
+    fn from(hit: DocHit) -> Self {
+        Self {
+            kind: hit.kind,
+            name: hit.name,
+            path: hit.path,
+            snippet: hit.snippet,
         }
     }
 }

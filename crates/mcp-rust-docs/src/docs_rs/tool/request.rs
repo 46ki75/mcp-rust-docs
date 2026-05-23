@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::docs_rs::use_case::{FetchCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput};
+use crate::docs_rs::use_case::{
+    FetchCrateDocsUseCaseInput, GrepCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
+};
 
 /// Arguments for the `get_crate_docs` tool.
 ///
@@ -76,6 +78,54 @@ pub struct SearchCrateSymbolsRequest {
 
 impl From<SearchCrateSymbolsRequest> for SearchCrateSymbolsUseCaseInput {
     fn from(request: SearchCrateSymbolsRequest) -> Self {
+        Self {
+            crate_name: request.crate_name,
+            version: request.version,
+            query: request.query,
+            kinds: request.kinds,
+            limit: request.limit,
+        }
+    }
+}
+
+/// Arguments for the `grep_crate_docs` tool.
+///
+/// `query` is matched as a case-insensitive substring against each
+/// item's doc-comment body (the raw Markdown rustdoc emits — intra-doc
+/// links and code fences intact). Results carry the matching item's
+/// `path`, which can be passed straight through as `get_crate_docs.path`
+/// to read the full doc page.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GrepCrateDocsRequest {
+    /// Crate name as published on crates.io.
+    pub crate_name: String,
+
+    /// Version selector. Defaults to `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// Required pattern. Case-insensitive substring matched against
+    /// each item's doc-comment body. Up to 256 characters. Empty /
+    /// whitespace-only is rejected.
+    pub query: String,
+
+    /// Optional kind filter. Accepted vocabulary: `struct`, `enum`,
+    /// `trait`, `union`, `macro`, `derive`, `attribute`, `fn`,
+    /// `type`, `module`, `constant`, `static`, `primitive`,
+    /// `traitalias`, `keyword`. Case-insensitive. Empty list is
+    /// treated as "no filter".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+
+    /// Maximum items to return. Defaults to 20, clamped to 100.
+    /// Lower than `search_crate_symbols` because each result carries a
+    /// ~200-character snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+impl From<GrepCrateDocsRequest> for GrepCrateDocsUseCaseInput {
+    fn from(request: GrepCrateDocsRequest) -> Self {
         Self {
             crate_name: request.crate_name,
             version: request.version,

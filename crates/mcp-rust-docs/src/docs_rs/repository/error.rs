@@ -32,4 +32,55 @@ pub enum DocsRsRepositoryError {
         /// Raw response body, kept for diagnostics.
         body: String,
     },
+
+    /// The compressed rustdoc-JSON payload (or its decompressed form)
+    /// exceeded the configured size cap. The cap exists so a single
+    /// huge crate (or a malicious upstream) can't exhaust memory.
+    #[error("docs.rs rustdoc JSON for {url} exceeds {limit_bytes}-byte cap")]
+    PayloadTooLarge {
+        /// URL whose payload exceeded the cap.
+        url: String,
+        /// The cap that fired, in bytes.
+        limit_bytes: usize,
+    },
+
+    /// zstd decompression of the rustdoc-JSON payload failed.
+    #[error("failed to decompress rustdoc JSON from {url}: {source}")]
+    Decompression {
+        /// URL that produced the unreadable payload.
+        url: String,
+        /// Wrapped zstd error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The decompressed payload was not valid rustdoc JSON, or used a
+    /// `format_version` `rustdoc-types` doesn't model. Both surfaces
+    /// the same `serde_json` error since `rustdoc-types`' deserializer
+    /// reports format-version mismatches through the same channel.
+    #[error("failed to parse rustdoc JSON from {url}: {source}")]
+    InvalidRustdocJson {
+        /// URL whose payload failed to parse.
+        url: String,
+        /// Wrapped serde error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The payload parsed, but its `format_version` doesn't match the
+    /// version `rustdoc-types` was built against. Broken out from
+    /// [`Self::InvalidRustdocJson`] because the model needs to know
+    /// this is an upstream-vs-tooling skew, not a corrupt response.
+    #[error(
+        "rustdoc JSON from {url} has format_version {actual}, but this build of mcp-rust-docs \
+         understands format_version {expected}"
+    )]
+    FormatVersionMismatch {
+        /// URL the JSON was fetched from.
+        url: String,
+        /// `format_version` reported by the payload.
+        actual: u32,
+        /// `format_version` this build of `rustdoc-types` was generated for.
+        expected: u32,
+    },
 }

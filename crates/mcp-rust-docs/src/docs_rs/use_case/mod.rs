@@ -8,11 +8,17 @@ pub mod output;
 use std::sync::Arc;
 
 pub use self::error::DocsRsUseCaseError;
-pub use self::input::{FetchCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput};
-pub use self::output::{FetchCrateDocsUseCaseOutput, SearchCrateSymbolsUseCaseOutput, SymbolEntry};
+pub use self::input::{
+    FetchCrateDocsUseCaseInput, GrepCrateDocsUseCaseInput, SearchCrateSymbolsUseCaseInput,
+};
+pub use self::output::{
+    DocHit, FetchCrateDocsUseCaseOutput, GrepCrateDocsUseCaseOutput,
+    SearchCrateSymbolsUseCaseOutput, SymbolEntry,
+};
 
 use crate::docs_rs::repository::{
     DocsRsRepository, FetchCrateDocsRepositoryInput, FetchCrateDocsRepositoryOutput,
+    FetchRustdocJsonRepositoryInput, FetchRustdocJsonRepositoryOutput,
 };
 
 const DEFAULT_VERSION: &str = "latest";
@@ -40,6 +46,22 @@ const MAX_SYMBOL_QUERY_LEN: usize = 128;
 /// has ~1k items) can't return them all in one shot.
 const DEFAULT_SYMBOL_LIMIT: u32 = 50;
 const MAX_SYMBOL_LIMIT: u32 = 500;
+
+/// Default and maximum result count for the doc-comment grep tool.
+/// Lower than the symbol-search cap because each hit ships a ~200-char
+/// snippet — the per-item payload is roughly 3x larger.
+const DEFAULT_GREP_LIMIT: u32 = 20;
+const MAX_GREP_LIMIT: u32 = 100;
+
+/// Cap on the grep query string. Generous enough for a short phrase
+/// ("zero-copy deserialization") but bounded so a runaway tool input
+/// can't force us to scan a kilobyte pattern across thousands of
+/// doc-comment bodies.
+const MAX_GREP_QUERY_LEN: usize = 256;
+
+/// Target length, in chars, of the snippet returned per doc-comment
+/// hit. Roughly two sentences either side of the match.
+const SNIPPET_TARGET_CHARS: usize = 200;
 
 /// Use case for fetching crate documentation from docs.rs.
 ///
@@ -160,6 +182,148 @@ impl DocsRsUseCase {
             items: matched,
         })
     }
+
+    /// Fetch the crate's rustdoc JSON, walk every documented item, and
+    /// return the ones whose doc-comment body contains `query`
+    /// (case-insensitive substring). Results are ranked by
+    /// item-name-match bonus, then hit count, then qualified name.
+    ///
+    /// Unlike [`Self::search_crate_symbols`] this requires a
+    /// non-empty query — "grep with no pattern" would return every
+    /// documented item in the crate, which is not useful.
+    #[tracing::instrument(skip(self))]
+    pub async fn grep_crate_docs(
+        &self,
+        input: GrepCrateDocsUseCaseInput,
+    ) -> Result<GrepCrateDocsUseCaseOutput, DocsRsUseCaseError> {
+        let crate_name = validate_crate_name(input.crate_name.trim())?;
+        let version = match input.version.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_VERSION.to_string(),
+            Some(v) => validate_version(v)?,
+        };
+        let query = validate_grep_query(input.query.trim())?;
+        let kinds: Option<Vec<String>> = input
+            .kinds
+            .map(|ks| {
+                ks.into_iter()
+                    .map(|k| k.trim().to_ascii_lowercase())
+                    .filter(|k| !k.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ks: &Vec<String>| !ks.is_empty());
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_GREP_LIMIT)
+            .clamp(1, MAX_GREP_LIMIT) as usize;
+
+        let url = build_rustdoc_json_url(&self.base_url, &crate_name, &version);
+
+        let FetchRustdocJsonRepositoryOutput {
+            final_url,
+            crate_json,
+        } = self
+            .repository
+            .fetch_rustdoc_json(FetchRustdocJsonRepositoryInput { url })
+            .await?;
+
+        let resolved_version = parse_rustdoc_json_version(&self.base_url, &crate_name, &final_url);
+
+        let query_lower = query.to_lowercase();
+        let mut hits: Vec<RankedHit> = Vec::new();
+
+        for (id, item) in &crate_json.index {
+            let docs = match item.docs.as_deref() {
+                Some(d) if !d.is_empty() => d,
+                _ => continue,
+            };
+            // Only items present in `paths` have addressable doc pages.
+            // Skip impls / fields / variants — their docs live on a
+            // parent page that the caller can find separately.
+            let summary = match crate_json.paths.get(id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let (kind, path) = match rustdoc_kind_and_path(summary) {
+                Some(parts) => parts,
+                None => continue,
+            };
+            if let Some(kinds) = kinds.as_deref()
+                && !kinds.iter().any(|k| k == &kind)
+            {
+                continue;
+            }
+
+            let docs_lower = docs.to_lowercase();
+            let hit_count = count_substr(&docs_lower, &query_lower);
+            if hit_count == 0 {
+                continue;
+            }
+
+            // `summary.path[0]` is the crate's lib name; the human-
+            // friendly qualified name skips it so the model sees
+            // `de::value::U8Deserializer`, not `serde::de::value::U8Deserializer`.
+            let qualified_name = qualified_name_from_summary(summary);
+            let name_match = item
+                .name
+                .as_deref()
+                .map(|n| n.to_lowercase().contains(&query_lower))
+                .unwrap_or(false);
+            let snippet = snippet_around(docs, &docs_lower, &query_lower, SNIPPET_TARGET_CHARS);
+
+            hits.push(RankedHit {
+                kind,
+                qualified_name,
+                path,
+                snippet,
+                hit_count,
+                name_match,
+            });
+        }
+
+        // Sort: name matches first, then more hits first, then
+        // qualified-name asc for a stable order.
+        hits.sort_by(|a, b| {
+            b.name_match
+                .cmp(&a.name_match)
+                .then_with(|| b.hit_count.cmp(&a.hit_count))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+
+        let total_matched = hits.len();
+        let truncated = total_matched > limit;
+        hits.truncate(limit);
+
+        let items = hits
+            .into_iter()
+            .map(|h| DocHit {
+                kind: h.kind,
+                name: h.qualified_name,
+                path: h.path,
+                snippet: h.snippet,
+            })
+            .collect();
+
+        Ok(GrepCrateDocsUseCaseOutput {
+            crate_name,
+            resolved_version,
+            total_matched,
+            truncated,
+            items,
+        })
+    }
+}
+
+/// Internal pre-sort representation. Carries the ranking signals so
+/// we can sort once after collection rather than computing them in
+/// the `sort_by` comparator (each item already paid the cost during
+/// the walk).
+struct RankedHit {
+    kind: String,
+    qualified_name: String,
+    path: String,
+    snippet: String,
+    hit_count: usize,
+    name_match: bool,
 }
 
 fn validate_crate_name(name: &str) -> Result<String, DocsRsUseCaseError> {
@@ -279,6 +443,180 @@ fn build_url(base_url: &str, crate_name: &str, version: &str, path: Option<&str>
 
 fn build_all_html_url(base_url: &str, crate_name: &str, version: &str) -> String {
     build_url(base_url, crate_name, version, Some("all.html"))
+}
+
+/// Build the docs.rs rustdoc-JSON URL. Shape:
+/// `{base}/crate/{crate}/{version}/json.zst`. Note the leading
+/// `/crate/` segment — this is a *different* docs.rs endpoint family
+/// from the rendered-HTML routes used by `fetch_crate_docs` and is
+/// NOT under the lib-name path. The `.zst` suffix selects the
+/// zstd-compressed variant (much smaller than `/json`).
+fn build_rustdoc_json_url(base_url: &str, crate_name: &str, version: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!("{base}/crate/{crate_name}/{version}/json.zst")
+}
+
+/// Parse the concrete version out of the redirected rustdoc-JSON URL.
+/// docs.rs serves `latest` by redirect, same as the HTML routes; the
+/// final URL is `{base}/crate/{crate}/{version}/json.zst`, so the
+/// version sits in the third path segment after the base.
+fn parse_rustdoc_json_version(base_url: &str, crate_name: &str, final_url: &str) -> Option<String> {
+    let prefix = format!("{}/crate/{crate_name}/", base_url.trim_end_matches('/'));
+    let rest = final_url.strip_prefix(&prefix)?;
+    let version = rest.split('/').next()?;
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+fn validate_grep_query(query: &str) -> Result<String, DocsRsUseCaseError> {
+    if query.is_empty() {
+        return Err(DocsRsUseCaseError::InvalidInput(
+            "query must not be empty (grep needs a pattern)".into(),
+        ));
+    }
+    if query.len() > MAX_GREP_QUERY_LEN {
+        return Err(DocsRsUseCaseError::InvalidInput(format!(
+            "query longer than {MAX_GREP_QUERY_LEN} characters"
+        )));
+    }
+    if query.chars().any(|c| c.is_control()) {
+        return Err(DocsRsUseCaseError::InvalidInput(
+            "query must not contain control characters".into(),
+        ));
+    }
+    Ok(query.to_string())
+}
+
+/// Map a [`rustdoc_types::ItemSummary`] onto the normalised kind
+/// string and the URL-path tail under the crate's docs root.
+///
+/// Returns `None` for kinds that don't have a dedicated page (impls,
+/// fields, variants, use-statements, etc.) or kinds we don't model.
+/// Filtering on `None` keeps the grep results to items the caller can
+/// actually open with `get_crate_docs`.
+fn rustdoc_kind_and_path(summary: &rustdoc_types::ItemSummary) -> Option<(String, String)> {
+    use rustdoc_types::ItemKind;
+    // `path[0]` is the crate lib name; drop it so the URL becomes
+    // relative to the crate docs root. `last` is the item's own name.
+    let mut segments = summary.path.iter();
+    let _crate = segments.next()?;
+    let parents: Vec<&str> = segments.clone().map(String::as_str).collect();
+    if parents.is_empty() {
+        // The summary refers to the crate root itself; it's the same
+        // page as `get_crate_docs` with no `path` argument, so callers
+        // don't gain anything from a grep hit here. Skip.
+        return None;
+    }
+    let last = parents.last().copied()?;
+    let parent_segments = &parents[..parents.len() - 1];
+    let dir = if parent_segments.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parent_segments.join("/"))
+    };
+
+    let (kind_str, filename) = match &summary.kind {
+        ItemKind::Module => ("module", format!("{}{last}/index.html", dir)),
+        ItemKind::Struct => ("struct", format!("{dir}struct.{last}.html")),
+        ItemKind::Union => ("union", format!("{dir}union.{last}.html")),
+        ItemKind::Enum => ("enum", format!("{dir}enum.{last}.html")),
+        ItemKind::Function => ("fn", format!("{dir}fn.{last}.html")),
+        ItemKind::TypeAlias => ("type", format!("{dir}type.{last}.html")),
+        ItemKind::Constant => ("constant", format!("{dir}constant.{last}.html")),
+        ItemKind::Trait => ("trait", format!("{dir}trait.{last}.html")),
+        ItemKind::TraitAlias => ("traitalias", format!("{dir}traitalias.{last}.html")),
+        ItemKind::Static => ("static", format!("{dir}static.{last}.html")),
+        ItemKind::Macro => ("macro", format!("{dir}macro.{last}.html")),
+        ItemKind::ProcDerive => ("derive", format!("{dir}derive.{last}.html")),
+        ItemKind::ProcAttribute => ("attribute", format!("{dir}attr.{last}.html")),
+        ItemKind::Primitive => ("primitive", format!("{dir}primitive.{last}.html")),
+        ItemKind::Keyword => ("keyword", format!("{dir}keyword.{last}.html")),
+        // Items without a dedicated page (impls, fields, variants,
+        // assoc-types/consts, use-statements, extern-crate /
+        // extern-type) are skipped.
+        _ => return None,
+    };
+    Some((kind_str.to_string(), filename))
+}
+
+/// Render the qualified name shown to the user. Drops the crate lib
+/// name (path[0]) so output matches what `search_crate_symbols`
+/// returns — `de::value::U8Deserializer`, not
+/// `serde::de::value::U8Deserializer`.
+fn qualified_name_from_summary(summary: &rustdoc_types::ItemSummary) -> String {
+    summary
+        .path
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`. Both
+/// sides are expected to be already-lowercased when called from
+/// `grep_crate_docs`; this function is byte-substring based and so
+/// behaves the same on any input where caller lowercasing is
+/// consistent.
+fn count_substr(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        count += 1;
+        start += rel + needle.len();
+    }
+    count
+}
+
+/// Build a snippet roughly `target_chars` wide, centered on the first
+/// occurrence of `needle_lower` within `docs_lower`. Returns the slice
+/// from the *original* `docs` string (preserving case) with `…` markers
+/// on either side when the slice doesn't cover the full body. Snaps to
+/// char boundaries so we never split a multi-byte sequence.
+fn snippet_around(docs: &str, docs_lower: &str, needle_lower: &str, target_chars: usize) -> String {
+    let hit = docs_lower.find(needle_lower).unwrap_or(0);
+    let half = target_chars / 2;
+    let start_byte = floor_char_boundary(docs, hit.saturating_sub(half));
+    let end_target = hit.saturating_add(needle_lower.len()).saturating_add(half);
+    let end_byte = ceil_char_boundary(docs, end_target.min(docs.len()));
+
+    let prefix = if start_byte > 0 { "…" } else { "" };
+    let suffix = if end_byte < docs.len() { "…" } else { "" };
+    // `replace('\n', " ")` keeps the snippet on one line so the
+    // JSON-rendered tool result stays readable in MCP Inspector
+    // panes that don't pretty-print embedded newlines.
+    let body = docs[start_byte..end_byte]
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .to_string();
+    format!("{prefix}{body}{suffix}")
+}
+
+/// `str::floor_char_boundary` is still nightly-only; this is the
+/// stable equivalent. Walks backwards from `i` until landing on a
+/// char boundary, capped at `s.len()`.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Stable analogue of `str::ceil_char_boundary`. Walks forwards from
+/// `i` until landing on a char boundary, capped at `s.len()`.
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn validate_symbol_query(query: &str) -> Result<String, DocsRsUseCaseError> {
@@ -1089,6 +1427,276 @@ mod tests {
         let entries = parse_all_html(html);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "de::Foo");
+    }
+
+    #[test]
+    fn build_rustdoc_json_url_uses_crate_endpoint() {
+        let u = build_rustdoc_json_url(BASE_URL, "tokio-util", "0.7.10");
+        // Note the `/crate/` prefix — this is the docs.rs metadata
+        // endpoint, NOT the lib-name path used by `fetch_crate_docs`.
+        // No hyphen→underscore translation either.
+        assert_eq!(u, "https://docs.rs/crate/tokio-util/0.7.10/json.zst");
+    }
+
+    #[test]
+    fn parse_rustdoc_json_version_strips_redirect_resolution() {
+        let v = parse_rustdoc_json_version(
+            BASE_URL,
+            "serde",
+            "https://docs.rs/crate/serde/1.0.219/json.zst",
+        );
+        assert_eq!(v.as_deref(), Some("1.0.219"));
+    }
+
+    #[test]
+    fn parse_rustdoc_json_version_returns_none_for_unexpected_shape() {
+        let v = parse_rustdoc_json_version(BASE_URL, "serde", "https://docs.rs/about");
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn validate_grep_query_rejects_empty_and_overlong() {
+        assert!(validate_grep_query("").is_err());
+        assert!(validate_grep_query(&"x".repeat(MAX_GREP_QUERY_LEN + 1)).is_err());
+        assert!(validate_grep_query("pin").is_ok());
+    }
+
+    #[test]
+    fn count_substr_counts_non_overlapping() {
+        assert_eq!(count_substr("zero-copy zero-copy", "zero"), 2);
+        assert_eq!(count_substr("aaaa", "aa"), 2);
+        assert_eq!(count_substr("xyz", "w"), 0);
+        assert_eq!(count_substr("anything", ""), 0);
+    }
+
+    #[test]
+    fn snippet_around_centers_match_and_marks_truncation() {
+        let docs = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+                    eiusmod tempor incididunt ut labore et zero-copy magna aliqua. \
+                    Ut enim ad minim veniam, quis nostrud exercitation.";
+        let docs_lower = docs.to_lowercase();
+        let snippet = snippet_around(docs, &docs_lower, "zero-copy", 60);
+        assert!(
+            snippet.contains("zero-copy"),
+            "snippet missing match: {snippet}"
+        );
+        assert!(
+            snippet.starts_with('…') && snippet.ends_with('…'),
+            "expected truncation markers on both sides: {snippet}",
+        );
+    }
+
+    #[test]
+    fn snippet_around_skips_truncation_marker_for_full_body() {
+        let docs = "Pin is great.";
+        let docs_lower = docs.to_lowercase();
+        let snippet = snippet_around(docs, &docs_lower, "pin", 200);
+        assert_eq!(snippet, "Pin is great.");
+    }
+
+    #[test]
+    fn snippet_around_collapses_internal_newlines() {
+        let docs = "First line.\n\nSecond line mentions Pin.\nThird line.";
+        let docs_lower = docs.to_lowercase();
+        let snippet = snippet_around(docs, &docs_lower, "pin", 200);
+        assert!(!snippet.contains('\n'), "newlines leaked: {snippet:?}");
+        assert!(snippet.contains("Pin"));
+    }
+
+    #[test]
+    fn snippet_around_respects_utf8_boundaries() {
+        // 😺 is 4 bytes; centering the snippet anywhere mid-emoji must
+        // not panic and must not produce invalid UTF-8.
+        let docs = "intro 😺😺😺 middle pin 😺😺😺 outro";
+        let docs_lower = docs.to_lowercase();
+        // Tiny target so the slice straddles the emoji clusters.
+        let snippet = snippet_around(docs, &docs_lower, "pin", 8);
+        assert!(snippet.contains("pin"));
+        // No panic == passing. Sanity: result must round-trip as UTF-8
+        // (which it does by construction, but check anyway).
+        assert!(snippet.is_char_boundary(0) && snippet.is_char_boundary(snippet.len()));
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_maps_struct() {
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec![
+                "serde".into(),
+                "de".into(),
+                "value".into(),
+                "U8Deserializer".into(),
+            ],
+            kind: rustdoc_types::ItemKind::Struct,
+        };
+        let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
+        assert_eq!(kind, "struct");
+        assert_eq!(path, "de/value/struct.U8Deserializer.html");
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_maps_module_to_index_html() {
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec!["serde".into(), "de".into(), "value".into()],
+            kind: rustdoc_types::ItemKind::Module,
+        };
+        let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
+        assert_eq!(kind, "module");
+        assert_eq!(path, "de/value/index.html");
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_maps_trait_at_crate_root() {
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec!["serde".into(), "Deserialize".into()],
+            kind: rustdoc_types::ItemKind::Trait,
+        };
+        let (kind, path) = rustdoc_kind_and_path(&summary).expect("addressable");
+        assert_eq!(kind, "trait");
+        assert_eq!(path, "trait.Deserialize.html");
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_skips_crate_root() {
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec!["serde".into()],
+            kind: rustdoc_types::ItemKind::Module,
+        };
+        assert!(rustdoc_kind_and_path(&summary).is_none());
+    }
+
+    #[test]
+    fn rustdoc_kind_and_path_skips_non_addressable_kinds() {
+        for kind in [
+            rustdoc_types::ItemKind::Impl,
+            rustdoc_types::ItemKind::StructField,
+            rustdoc_types::ItemKind::Variant,
+            rustdoc_types::ItemKind::AssocConst,
+            rustdoc_types::ItemKind::AssocType,
+        ] {
+            let summary = rustdoc_types::ItemSummary {
+                crate_id: 0,
+                path: vec!["serde".into(), "Foo".into()],
+                kind,
+            };
+            assert!(rustdoc_kind_and_path(&summary).is_none());
+        }
+    }
+
+    #[test]
+    fn qualified_name_strips_crate_lib_segment() {
+        let summary = rustdoc_types::ItemSummary {
+            crate_id: 0,
+            path: vec![
+                "serde".into(),
+                "de".into(),
+                "value".into(),
+                "U8Deserializer".into(),
+            ],
+            kind: rustdoc_types::ItemKind::Struct,
+        };
+        assert_eq!(
+            qualified_name_from_summary(&summary),
+            "de::value::U8Deserializer",
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_empty_query() {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        let use_case = use_case_with(stub);
+        let err = use_case
+            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: None,
+                query: "   ".into(),
+                kinds: None,
+                limit: None,
+            })
+            .await
+            .expect_err("expected InvalidInput");
+        assert!(matches!(err, DocsRsUseCaseError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn grep_targets_crate_json_endpoint() {
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        let use_case = use_case_with(stub.clone());
+        // No JSON enqueued; stub returns NotFound for us. We only care
+        // here that the URL the use case built was the rustdoc-JSON
+        // endpoint, not the lib-name path.
+        let _ = use_case
+            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+                crate_name: "tokio-util".into(),
+                version: Some("0.7.10".into()),
+                query: "pin".into(),
+                kinds: None,
+                limit: None,
+            })
+            .await;
+        assert_eq!(
+            stub.last_seen_url().await.as_deref(),
+            Some("https://docs.rs/crate/tokio-util/0.7.10/json.zst"),
+        );
+    }
+
+    /// End-to-end use-case test against the real anyhow rustdoc-JSON
+    /// fixture (decompressed in-process via ruzstd). Complements the
+    /// transport-level test in `tests/grep_crate_docs.rs` by exercising
+    /// ranking, snippet generation, and the kind filter without
+    /// spinning up an MCP server or wiremock.
+    #[tokio::test]
+    async fn grep_against_anyhow_fixture_returns_ranked_hits() -> anyhow::Result<()> {
+        use std::io::Read;
+        // Path is relative to this file. The integration test in
+        // `tests/grep_crate_docs.rs` uses the same fixture via a
+        // shorter relative path.
+        const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/anyhow_rustdoc.json.zst");
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(FIXTURE)?;
+        let mut decompressed = Vec::with_capacity(512 * 1024);
+        decoder.read_to_end(&mut decompressed)?;
+        let crate_json: Arc<rustdoc_types::Crate> =
+            Arc::new(serde_json::from_slice(&decompressed)?);
+
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue_json(Ok(FetchRustdocJsonRepositoryOutput {
+            final_url: "https://docs.rs/crate/anyhow/1.0.86/json.zst".into(),
+            crate_json,
+        }))
+        .await;
+        let use_case = use_case_with(stub);
+
+        let out = use_case
+            .grep_crate_docs(GrepCrateDocsUseCaseInput {
+                crate_name: "anyhow".into(),
+                version: None,
+                query: "error".into(),
+                kinds: None,
+                limit: Some(5),
+            })
+            .await?;
+
+        assert_eq!(out.crate_name, "anyhow");
+        assert_eq!(out.resolved_version.as_deref(), Some("1.0.86"));
+        assert!(out.total_matched > 0, "expected hits in anyhow for `error`");
+        assert!(out.items.len() <= 5);
+        // Every hit must carry the full quartet, and the snippet must
+        // contain the query (case-insensitive) — that's the contract
+        // the tool layer depends on.
+        for hit in &out.items {
+            assert!(!hit.kind.is_empty());
+            assert!(!hit.name.is_empty());
+            assert!(!hit.path.is_empty());
+            assert!(
+                hit.snippet.to_lowercase().contains("error"),
+                "snippet missing query: {:?}",
+                hit.snippet,
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]

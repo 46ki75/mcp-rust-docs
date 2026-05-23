@@ -57,3 +57,44 @@ pub struct SymbolEntry {
     /// verbatim as the `path` argument to `get_crate_docs`.
     pub path: String,
 }
+
+/// Result returned by the doc-comment grep use case.
+///
+/// Same shape as [`SearchCrateSymbolsUseCaseOutput`] so models that
+/// know one tool's response can read the other's without re-learning.
+/// `total_matched` is the pre-truncation count so the caller can tell
+/// when to narrow the query.
+#[derive(Debug, Clone)]
+pub struct GrepCrateDocsUseCaseOutput {
+    /// Crate name as requested (post-normalisation).
+    pub crate_name: String,
+    /// Concrete version docs.rs served the JSON from, parsed out of
+    /// the redirected URL. `None` if the URL shape was unexpected.
+    pub resolved_version: Option<String>,
+    /// Total items whose doc comments matched the filters before
+    /// `limit` was applied.
+    pub total_matched: usize,
+    /// `true` when more items matched than the limit returned.
+    pub truncated: bool,
+    /// Matched items, ranked by (name-match-bonus, hit-count desc,
+    /// qualified-name asc).
+    pub items: Vec<DocHit>,
+}
+
+/// One doc-comment match returned by the grep use case.
+#[derive(Debug, Clone)]
+pub struct DocHit {
+    /// Normalised rustdoc kind (`struct`, `enum`, `trait`, `fn`,
+    /// `macro`, `derive`, `module`, `type`, `constant`, `static`,
+    /// `union`, `primitive`, `keyword`).
+    pub kind: String,
+    /// Fully-qualified item name as rustdoc renders it
+    /// (e.g. `de::value::U8Deserializer`).
+    pub name: String,
+    /// URL-path tail relative to the crate's docs root. Pass this
+    /// verbatim to `get_crate_docs.path` to read the full docs.
+    pub path: String,
+    /// Short excerpt of the doc comment centered on the first match,
+    /// with leading / trailing `…` when truncated. ~200 chars.
+    pub snippet: String,
+}
