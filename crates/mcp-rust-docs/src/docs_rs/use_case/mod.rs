@@ -107,14 +107,7 @@ impl DocsRsUseCase {
             .await?;
 
         let resolved_version = parse_version_from_url(&self.base_url, &crate_name, &final_url);
-        // `html2md::rewrite_html` is CPU-bound and runs in the tens of
-        // ms on a hundreds-of-KB docs.rs page — long enough to stall
-        // other in-flight requests on the HTTP transport if we ran it
-        // on the async worker. Same reasoning as
-        // `fetch_rustdoc_json` (see repository::fetch_rustdoc_json).
-        let markdown = tokio::task::spawn_blocking(move || html_to_markdown(&html))
-            .await
-            .expect("html_to_markdown panicked");
+        let markdown = run_blocking_html_conversion(move || html_to_markdown(&html)).await?;
 
         Ok(FetchCrateDocsUseCaseOutput {
             crate_name,
@@ -1091,6 +1084,28 @@ fn html_to_markdown(html: &str) -> String {
     // Markdown renderers (avoids the GitHub-only extensions the
     // library emits by default).
     html2md::rewrite_html(body, true)
+}
+
+/// Run a CPU-bound HTML→Markdown conversion on the blocking pool and
+/// translate any task-join failure into [`DocsRsUseCaseError::Internal`].
+///
+/// `html2md::rewrite_html` is CPU-bound and runs in the tens of ms on
+/// a hundreds-of-KB docs.rs page — long enough to stall other in-flight
+/// requests on the HTTP transport if we ran it on the async worker.
+/// Same reasoning as `fetch_rustdoc_json` (see
+/// `repository::fetch_rustdoc_json`).
+///
+/// The closure-parameterised shape exists for testability: production
+/// passes `move || html_to_markdown(&html)`, unit tests can pass a
+/// panicking closure to pin the JoinError-translation contract without
+/// needing to find an HTML input that html2md actually panics on.
+async fn run_blocking_html_conversion<F>(work: F) -> Result<String, DocsRsUseCaseError>
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|join_err| {
+        DocsRsUseCaseError::Internal(format!("html_to_markdown task failed: {join_err}"))
+    })
 }
 
 #[cfg(test)]
@@ -2300,5 +2315,47 @@ mod tests {
             Some("real"),
             "find_attr must match the real attribute, not a substring inside a quoted value",
         );
+    }
+
+    /// Regression: the HTML→Markdown conversion runs inside
+    /// `spawn_blocking`. If the blocking task panics (e.g. an html2md
+    /// regression, or runtime shutdown producing a JoinError) the
+    /// `JoinError` MUST surface as a typed `Internal` error so the
+    /// tool layer can render it cleanly — not propagate as a runtime
+    /// panic that aborts the request handler. Pre-fix the call site
+    /// used `.expect("html_to_markdown panicked")` which would do
+    /// exactly that.
+    ///
+    /// We can't easily make `html_to_markdown` itself panic from a
+    /// crafted HTML input (fast_html2md is robust on the inputs a
+    /// unit test can fabricate), so this test exercises the helper
+    /// `html_to_markdown_blocking` with input that triggers the
+    /// JoinError path via panic propagation. The helper's
+    /// JoinError → Internal mapping is the load-bearing contract.
+    #[tokio::test]
+    async fn html_to_markdown_blocking_translates_task_panic_to_internal_error() {
+        // Drive the helper through a closure that panics. The helper
+        // signature must allow injecting the blocking work so the test
+        // can choose to panic; the production call site passes
+        // `html_to_markdown`.
+        let outcome = run_blocking_html_conversion(|| panic!("simulated html2md panic")).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(DocsRsUseCaseError::Internal(ref msg))
+                    if msg.contains("html_to_markdown task failed"),
+            ),
+            "expected Internal error from JoinError, got {outcome:?}",
+        );
+    }
+
+    /// Positive control for [`run_blocking_html_conversion`]: a
+    /// well-behaved closure returning a String comes through as
+    /// `Ok(_)`. Without this, the JoinError test above could pass
+    /// vacuously if the helper always returned an error.
+    #[tokio::test]
+    async fn html_to_markdown_blocking_returns_ok_for_non_panicking_closure() {
+        let outcome = run_blocking_html_conversion(|| "hello world".to_string()).await;
+        assert_eq!(outcome.expect("ok"), "hello world");
     }
 }

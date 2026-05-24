@@ -110,7 +110,14 @@ impl CratesIoUseCase {
         // upstream round-trip.
         crate::validation::validate_crate_name_chars(crate_name)
             .map_err(CratesIoUseCaseError::InvalidQuery)?;
-        let crate_name = crate_name.to_string();
+        // Match docs.rs's lowercasing. docs.rs URLs are case-sensitive
+        // and `DocsRsUseCase::fetch_crate_docs` already lowercases the
+        // name; crates.io is case-insensitive on the wire today, but
+        // a strict mirror or future behaviour change could 404 the
+        // metadata side only — surfacing a confusing `metadata_error`
+        // next to a successful docs payload. Normalising here keeps
+        // the two halves of `get_crate_docs` in lock-step.
+        let crate_name = crate_name.to_ascii_lowercase();
 
         let aggregate = self
             .repository
@@ -773,6 +780,53 @@ mod tests {
             ),
             "unexpected error: {err:?}",
         );
+    }
+
+    /// Regression: the two halves of `get_crate_docs` (docs.rs +
+    /// crates.io) MUST agree on crate-name normalisation. docs.rs URLs
+    /// are case-sensitive and `DocsRsUseCase::fetch_crate_docs`
+    /// lowercases the name before issuing the request. crates.io is
+    /// case-insensitive on the wire, but a strict mirror or a future
+    /// behaviour change could 404 the metadata side only — surfacing
+    /// a confusing `metadata_error` next to a successful docs payload.
+    /// Lowercasing here keeps the two sides in lock-step.
+    ///
+    /// Pinned by inspecting `seen_crate_names` on the stub: every
+    /// per-crate upstream call (aggregate + dependencies) must have
+    /// been issued with the lowercase form, regardless of the user's
+    /// input casing.
+    #[tokio::test]
+    async fn metadata_lowercases_crate_name_before_upstream_call() -> anyhow::Result<()> {
+        let stub = Arc::new(CratesIoRepositoryStub::new());
+        stub.enqueue_crate(Ok(aggregate_for(
+            "tokio",
+            vec![version_entry("1.40.0", false)],
+        )))
+        .await;
+        stub.enqueue_dependencies(Ok(FetchCrateVersionDependenciesRepositoryOutput {
+            dependencies: vec![],
+        }))
+        .await;
+
+        let use_case = CratesIoUseCase::new(stub.clone());
+        let _ = use_case
+            .get_crate_metadata(GetCrateMetadataUseCaseInput {
+                crate_name: "Tokio".into(),
+                version: None,
+            })
+            .await?;
+
+        let seen = stub.seen_crate_names().await;
+        assert!(
+            !seen.is_empty(),
+            "expected at least one upstream call to have been made",
+        );
+        assert!(
+            seen.iter().all(|n| n == "tokio"),
+            "every upstream call must use the lowercased crate name to match \
+             docs.rs's normalisation; got {seen:?}",
+        );
+        Ok(())
     }
 
     /// When crates.io returns an aggregate whose `max_stable_version`

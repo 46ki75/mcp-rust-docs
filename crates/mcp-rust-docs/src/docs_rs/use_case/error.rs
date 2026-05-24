@@ -35,4 +35,13 @@ pub enum DocsRsUseCaseError {
         /// Format versions the fallback chain attempted, in order.
         tried: Vec<u32>,
     },
+
+    /// An internal task plumbing failure — currently only fires when a
+    /// `spawn_blocking` join returns a `JoinError` (panic in the
+    /// blocking closure or runtime shutdown). Surfaced as a typed
+    /// error rather than a `.expect()` panic so the tool layer can
+    /// render it as a regular upstream failure instead of aborting
+    /// the request handler.
+    #[error("internal docs.rs use case failure: {0}")]
+    Internal(String),
 }

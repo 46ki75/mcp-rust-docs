@@ -298,6 +298,11 @@ pub(crate) struct CratesIoRepositoryStub {
     queue: tokio::sync::Mutex<Vec<SearchCratesResult>>,
     crate_queue: tokio::sync::Mutex<Vec<FetchCrateResult>>,
     deps_queue: tokio::sync::Mutex<Vec<FetchCrateVersionDependenciesResult>>,
+    /// Captured `crate_name` strings for every per-crate call
+    /// (`fetch_crate` and `fetch_crate_version_dependencies`), in
+    /// arrival order. Lets unit tests pin name-normalisation policy
+    /// (e.g. that the use case lowercases before talking upstream).
+    seen_crate_names: tokio::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -316,6 +321,12 @@ impl CratesIoRepositoryStub {
 
     pub(crate) async fn enqueue_dependencies(&self, result: FetchCrateVersionDependenciesResult) {
         self.deps_queue.lock().await.push(result);
+    }
+
+    /// Snapshot of every `crate_name` the stub has been asked about,
+    /// across both per-crate trait methods, in arrival order.
+    pub(crate) async fn seen_crate_names(&self) -> Vec<String> {
+        self.seen_crate_names.lock().await.clone()
     }
 }
 
@@ -337,6 +348,10 @@ impl CratesIoRepository for CratesIoRepositoryStub {
 
     fn fetch_crate(&self, input: FetchCrateInput) -> BoxFuture<'_, FetchCrateResult> {
         Box::pin(async move {
+            self.seen_crate_names
+                .lock()
+                .await
+                .push(input.crate_name.clone());
             self.crate_queue.lock().await.pop().unwrap_or_else(|| {
                 Err(CratesIoRepositoryError::NotFound {
                     url: format!("stub://{}", input.crate_name),
@@ -350,6 +365,10 @@ impl CratesIoRepository for CratesIoRepositoryStub {
         input: FetchCrateVersionDependenciesInput,
     ) -> BoxFuture<'_, FetchCrateVersionDependenciesResult> {
         Box::pin(async move {
+            self.seen_crate_names
+                .lock()
+                .await
+                .push(input.crate_name.clone());
             self.deps_queue.lock().await.pop().unwrap_or_else(|| {
                 Err(CratesIoRepositoryError::NotFound {
                     url: format!("stub://{}/{}", input.crate_name, input.version),

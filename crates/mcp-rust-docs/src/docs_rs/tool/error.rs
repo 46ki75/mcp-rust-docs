@@ -43,6 +43,9 @@ impl DocsRsToolError {
             Self::UseCase(DocsRsUseCaseError::Repository(err)) => {
                 format!("Upstream failure: {err}")
             }
+            Self::UseCase(DocsRsUseCaseError::Internal(reason)) => {
+                format!("Upstream failure: {reason}")
+            }
         };
         CallToolResult::error(vec![Content::text(message)])
     }
