@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::Server;
 use crate::crates_io::repository::{CratesIoRepository, CratesIoRepositoryImpl};
@@ -12,6 +13,32 @@ pub const CRATES_IO_BASE_URL: &str = "https://crates.io";
 
 /// Default docs.rs upstream — the public documentation host.
 pub const DOCS_RS_BASE_URL: &str = "https://docs.rs";
+
+/// Default overall HTTP request timeout applied to the built-in
+/// `reqwest::Client`.
+///
+/// Without this cap a stuck upstream socket pins the request handler
+/// indefinitely — the streamable-HTTP transport has no per-call
+/// deadline of its own. 30s is generous for docs.rs's largest rustdoc
+/// JSON downloads while still surfacing a real outage as an error
+/// instead of a hang.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default TCP-connect timeout applied to the built-in
+/// `reqwest::Client`. Distinct from the overall request timeout so a
+/// dead upstream fails fast at the SYN-ACK stage rather than burning
+/// the full request budget.
+pub const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-response body size cap applied to both upstream
+/// repositories.
+///
+/// The largest payload either upstream serves in practice is the
+/// zstd-compressed rustdoc JSON for huge crates — tens of MB. 128 MB
+/// leaves headroom for outliers while keeping a misbehaving mirror
+/// from pinning the process with a 10 GB body. Decompressed JSON is
+/// independently capped at 64 MB inside the docs.rs repository.
+pub const DEFAULT_UPSTREAM_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Default `User-Agent` header sent by the built-in HTTP client.
 ///
@@ -35,6 +62,9 @@ pub struct ServerBuilder {
     docs_rs_base_url: String,
     user_agent: String,
     http: Option<reqwest::Client>,
+    http_timeout: Duration,
+    http_connect_timeout: Duration,
+    upstream_body_size_limit: usize,
     crates_io_repository: Option<Arc<dyn CratesIoRepository>>,
     docs_rs_repository: Option<Arc<dyn DocsRsRepository>>,
     docs_rs_cache_enabled: bool,
@@ -47,6 +77,9 @@ impl Default for ServerBuilder {
             docs_rs_base_url: DOCS_RS_BASE_URL.to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             http: None,
+            http_timeout: DEFAULT_HTTP_TIMEOUT,
+            http_connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
+            upstream_body_size_limit: DEFAULT_UPSTREAM_BODY_BYTES,
             crates_io_repository: None,
             docs_rs_repository: None,
             docs_rs_cache_enabled: true,
@@ -81,8 +114,42 @@ impl ServerBuilder {
 
     /// Supply a pre-built `reqwest::Client`. Useful for sharing one
     /// connection pool across both tools, or applying custom timeouts.
+    ///
+    /// **Caveat:** when a client is supplied here, the
+    /// [`http_timeout`](Self::http_timeout) and
+    /// [`http_connect_timeout`](Self::http_connect_timeout) settings
+    /// are ignored — the injected client owns its own timeout
+    /// configuration.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http = Some(client);
+        self
+    }
+
+    /// Override the overall HTTP request timeout applied to the
+    /// built-in client. Defaults to [`DEFAULT_HTTP_TIMEOUT`].
+    /// No-op when [`http_client`](Self::http_client) is also set.
+    pub fn http_timeout(mut self, timeout: Duration) -> Self {
+        self.http_timeout = timeout;
+        self
+    }
+
+    /// Override the TCP-connect timeout applied to the built-in
+    /// client. Defaults to [`DEFAULT_HTTP_CONNECT_TIMEOUT`].
+    /// No-op when [`http_client`](Self::http_client) is also set.
+    pub fn http_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.http_connect_timeout = timeout;
+        self
+    }
+
+    /// Override the per-response upstream body-size cap applied by
+    /// both repositories. Defaults to [`DEFAULT_UPSTREAM_BODY_BYTES`].
+    ///
+    /// Ignored when [`crates_io_repository`](Self::crates_io_repository)
+    /// or [`docs_rs_repository`](Self::docs_rs_repository) is supplied
+    /// for the corresponding side — the injected repository owns its
+    /// own body limit.
+    pub fn upstream_body_size_limit(mut self, limit: usize) -> Self {
+        self.upstream_body_size_limit = limit;
         self
     }
 
@@ -129,6 +196,8 @@ impl ServerBuilder {
         // and `self.user_agent` by `Option::take` semantics.
         let mut http_override = self.http;
         let user_agent = self.user_agent;
+        let http_timeout = self.http_timeout;
+        let http_connect_timeout = self.http_connect_timeout;
         let mut shared_http: Option<reqwest::Client> = None;
         let mut get_http = || -> Result<reqwest::Client, Error> {
             if let Some(client) = &shared_http {
@@ -138,23 +207,28 @@ impl ServerBuilder {
                 Some(c) => c,
                 None => reqwest::Client::builder()
                     .user_agent(user_agent.clone())
+                    .timeout(http_timeout)
+                    .connect_timeout(http_connect_timeout)
                     .build()?,
             };
             shared_http = Some(client.clone());
             Ok(client)
         };
 
+        let body_limit = self.upstream_body_size_limit;
         let crates_io_repository: Arc<dyn CratesIoRepository> = match self.crates_io_repository {
             Some(repository) => repository,
-            None => Arc::new(CratesIoRepositoryImpl::new(
-                get_http()?,
-                self.crates_io_base_url,
-            )),
+            None => Arc::new(
+                CratesIoRepositoryImpl::new(get_http()?, self.crates_io_base_url)
+                    .with_max_body_bytes(body_limit),
+            ),
         };
 
         let docs_rs_repository: Arc<dyn DocsRsRepository> = match self.docs_rs_repository {
             Some(repository) => repository,
-            None => Arc::new(DocsRsRepositoryImpl::new(get_http()?)),
+            None => {
+                Arc::new(DocsRsRepositoryImpl::new(get_http()?).with_max_body_bytes(body_limit))
+            }
         };
         let docs_rs_repository: Arc<dyn DocsRsRepository> = if self.docs_rs_cache_enabled {
             Arc::new(CachingDocsRsRepository::new(docs_rs_repository))

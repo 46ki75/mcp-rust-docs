@@ -70,6 +70,7 @@ pub trait CratesIoRepository: Send + Sync + 'static {
 pub struct CratesIoRepositoryImpl {
     http: reqwest::Client,
     base_url: Arc<str>,
+    max_body_bytes: usize,
 }
 
 impl CratesIoRepositoryImpl {
@@ -80,7 +81,16 @@ impl CratesIoRepositoryImpl {
         Self {
             http,
             base_url: base_url.into(),
+            max_body_bytes: crate::router::DEFAULT_UPSTREAM_BODY_BYTES,
         }
+    }
+
+    /// Override the per-response body-size cap. Below this, body bytes
+    /// are streamed into memory normally; above, the request errors
+    /// with [`CratesIoRepositoryError::PayloadTooLarge`].
+    pub fn with_max_body_bytes(mut self, limit: usize) -> Self {
+        self.max_body_bytes = limit;
+        self
     }
 }
 
@@ -105,7 +115,8 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
                 .send()
                 .await?;
 
-            let body_bytes = check_status_and_read_body(response, &url).await?;
+            let body_bytes =
+                check_status_and_read_body(response, &url, self.max_body_bytes).await?;
             let parsed: CratesIoSearchResponse = serde_json::from_slice(&body_bytes)
                 .map_err(CratesIoRepositoryError::InvalidResponse)?;
 
@@ -135,7 +146,8 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
         Box::pin(async move {
             let url = format!("{}/api/v1/crates/{}", self.base_url, input.crate_name);
             let response = self.http.get(&url).send().await?;
-            let body_bytes = check_status_and_read_body(response, &url).await?;
+            let body_bytes =
+                check_status_and_read_body(response, &url, self.max_body_bytes).await?;
             let parsed: CratesIoCrateResponse = serde_json::from_slice(&body_bytes)
                 .map_err(CratesIoRepositoryError::InvalidResponse)?;
 
@@ -167,7 +179,8 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
                 self.base_url, input.crate_name, input.version,
             );
             let response = self.http.get(&url).send().await?;
-            let body_bytes = check_status_and_read_body(response, &url).await?;
+            let body_bytes =
+                check_status_and_read_body(response, &url, self.max_body_bytes).await?;
             let parsed: CratesIoDependenciesResponse = serde_json::from_slice(&body_bytes)
                 .map_err(CratesIoRepositoryError::InvalidResponse)?;
 
@@ -197,10 +210,19 @@ impl CratesIoRepository for CratesIoRepositoryImpl {
 /// Consolidated status check: 404 → `NotFound`, other non-2xx →
 /// `UpstreamStatus` with body, 2xx → return body bytes. Centralised so
 /// the three endpoint impls share identical error routing.
+///
+/// Reads the body in streaming chunks and aborts with
+/// [`CratesIoRepositoryError::PayloadTooLarge`] once `limit_bytes` is
+/// exceeded — so a misbehaving mirror cannot exhaust memory with an
+/// inflated `Content-Length`. Error bodies are bounded by a smaller
+/// fixed cap because they're only used as diagnostic text.
 async fn check_status_and_read_body(
     response: reqwest::Response,
     url: &str,
+    limit_bytes: usize,
 ) -> Result<Vec<u8>, CratesIoRepositoryError> {
+    const ERROR_BODY_CAP: usize = 16 * 1024;
+
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(CratesIoRepositoryError::NotFound {
@@ -208,14 +230,39 @@ async fn check_status_and_read_body(
         });
     }
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body_bytes = read_body_bounded(response, url, ERROR_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&body_bytes).into_owned();
         return Err(CratesIoRepositoryError::UpstreamStatus {
             status,
             url: url.to_string(),
             body,
         });
     }
-    Ok(response.bytes().await?.to_vec())
+    read_body_bounded(response, url, limit_bytes).await
+}
+
+/// Stream a response body into memory, aborting once the running size
+/// exceeds `limit_bytes`. Uses [`reqwest::Response::chunk`] rather
+/// than `bytes()` so a 10 GB `Content-Length` cannot allocate before
+/// the cap fires.
+async fn read_body_bounded(
+    mut response: reqwest::Response,
+    url: &str,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, CratesIoRepositoryError> {
+    let mut acc: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if acc.len().saturating_add(chunk.len()) > limit_bytes {
+            return Err(CratesIoRepositoryError::PayloadTooLarge {
+                url: url.to_string(),
+                limit_bytes,
+            });
+        }
+        acc.extend_from_slice(&chunk);
+    }
+    Ok(acc)
 }
 
 #[derive(Debug, Deserialize)]

@@ -41,4 +41,16 @@ pub enum CratesIoRepositoryError {
     /// schema — usually means the registry changed its response shape.
     #[error("failed to decode crates.io response: {0}")]
     InvalidResponse(serde_json::Error),
+
+    /// The registry's response body exceeded the configured size cap
+    /// before EOF. Prevents a misbehaving mirror from exhausting
+    /// memory with an unbounded `Content-Length` (or unbounded
+    /// chunked-transfer) response.
+    #[error("crates.io response body for {url} exceeds {limit_bytes}-byte cap")]
+    PayloadTooLarge {
+        /// URL whose body exceeded the cap.
+        url: String,
+        /// The cap that fired, in bytes.
+        limit_bytes: usize,
+    },
 }

@@ -454,6 +454,14 @@ fn validate_version(version: &str) -> Result<String, DocsRsUseCaseError> {
             "version must not contain `..`".into(),
         ));
     }
+    // docs.rs URLs are case-sensitive: only `latest` (lowercase) is
+    // the redirect alias. CratesIoUseCase normalises the same literal
+    // via `eq_ignore_ascii_case`; without matching it here, a
+    // `get_crate_docs` root call with `version="Latest"` returns
+    // metadata but 404s the docs payload.
+    if version.eq_ignore_ascii_case(DEFAULT_VERSION) {
+        return Ok(DEFAULT_VERSION.to_string());
+    }
     Ok(version.to_string())
 }
 
@@ -1269,6 +1277,37 @@ mod tests {
             .await?;
 
         assert_eq!(out.crate_name, "tokio");
+        assert_eq!(
+            stub.last_seen_url().await.as_deref(),
+            Some("https://docs.rs/tokio/latest/tokio/"),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_normalises_mixed_case_latest_version() -> anyhow::Result<()> {
+        // docs.rs URLs are case-sensitive: `/Latest/` is not equivalent
+        // to `/latest/`. CratesIoUseCase already normalises the literal
+        // via `eq_ignore_ascii_case`, so the two halves of
+        // `get_crate_docs` would otherwise drift out of lock-step on a
+        // root call with `version="Latest"` — metadata succeeds, docs
+        // 404s. Pin the same case-insensitive normalisation here.
+        let stub = Arc::new(DocsRsRepositoryStub::new());
+        stub.enqueue(Ok(FetchCrateDocsRepositoryOutput {
+            final_url: "https://docs.rs/tokio/1.40.0/tokio/".into(),
+            html: String::new(),
+        }))
+        .await;
+        let use_case = use_case_with(stub.clone());
+
+        let _ = use_case
+            .fetch_crate_docs(FetchCrateDocsUseCaseInput {
+                crate_name: "tokio".into(),
+                version: Some("Latest".into()),
+                path: None,
+            })
+            .await?;
+
         assert_eq!(
             stub.last_seen_url().await.as_deref(),
             Some("https://docs.rs/tokio/latest/tokio/"),

@@ -43,6 +43,33 @@ pub type FetchRustdocJsonResult = Result<FetchRustdocJsonRepositoryOutput, DocsR
 /// bounded.
 const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 
+/// Cap on diagnostic body bytes captured when an upstream response is
+/// non-2xx. Distinct from the success-path cap because error bodies
+/// are only used as a string in [`DocsRsRepositoryError::UpstreamStatus`].
+const ERROR_BODY_CAP: usize = 16 * 1024;
+
+/// Stream a response body into memory, aborting once the running size
+/// exceeds `limit_bytes`. Uses [`reqwest::Response::chunk`] rather
+/// than `bytes()` so an oversized `Content-Length` cannot allocate
+/// before the cap fires.
+async fn read_body_bounded(
+    mut response: reqwest::Response,
+    url: &str,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, DocsRsRepositoryError> {
+    let mut acc: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if acc.len().saturating_add(chunk.len()) > limit_bytes {
+            return Err(DocsRsRepositoryError::PayloadTooLarge {
+                url: url.to_string(),
+                limit_bytes,
+            });
+        }
+        acc.extend_from_slice(&chunk);
+    }
+    Ok(acc)
+}
+
 /// Repository abstraction over docs.rs HTTP fetches.
 ///
 /// Held as `Arc<dyn DocsRsRepository>` by the use case so a stub can
@@ -76,13 +103,27 @@ pub trait DocsRsRepository: Send + Sync + 'static {
 /// any compatible mirror) over HTTPS.
 pub struct DocsRsRepositoryImpl {
     http: reqwest::Client,
+    max_body_bytes: usize,
 }
 
 impl DocsRsRepositoryImpl {
     /// Wrap a pre-built `reqwest::Client`. The client's `User-Agent`
     /// header is preserved — set it before passing in.
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+        Self {
+            http,
+            max_body_bytes: crate::router::DEFAULT_UPSTREAM_BODY_BYTES,
+        }
+    }
+
+    /// Override the per-response body-size cap. Aborts the read with
+    /// [`DocsRsRepositoryError::PayloadTooLarge`] once the running size
+    /// exceeds `limit`. The decompression cap
+    /// ([`MAX_DECOMPRESSED_BYTES`]) is unrelated and still applies to
+    /// the post-zstd output.
+    pub fn with_max_body_bytes(mut self, limit: usize) -> Self {
+        self.max_body_bytes = limit;
+        self
     }
 }
 
@@ -101,7 +142,10 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
             }
 
             if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
+                let body_bytes = read_body_bounded(response, &final_url, ERROR_BODY_CAP)
+                    .await
+                    .unwrap_or_default();
+                let body = String::from_utf8_lossy(&body_bytes).into_owned();
                 return Err(DocsRsRepositoryError::UpstreamStatus {
                     status,
                     url: final_url,
@@ -109,7 +153,8 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
                 });
             }
 
-            let html = response.text().await?;
+            let html_bytes = read_body_bounded(response, &final_url, self.max_body_bytes).await?;
+            let html = String::from_utf8_lossy(&html_bytes).into_owned();
             Ok(FetchCrateDocsRepositoryOutput { final_url, html })
         })
     }
@@ -127,7 +172,10 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
                 return Err(DocsRsRepositoryError::NotFound { url: final_url });
             }
             if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
+                let body_bytes = read_body_bounded(response, &final_url, ERROR_BODY_CAP)
+                    .await
+                    .unwrap_or_default();
+                let body = String::from_utf8_lossy(&body_bytes).into_owned();
                 return Err(DocsRsRepositoryError::UpstreamStatus {
                     status,
                     url: final_url,
@@ -135,7 +183,7 @@ impl DocsRsRepository for DocsRsRepositoryImpl {
                 });
             }
 
-            let compressed = response.bytes().await?;
+            let compressed = read_body_bounded(response, &final_url, self.max_body_bytes).await?;
 
             // Streaming-decompress and parse on the thread pool — both
             // are CPU-bound and would otherwise hog the runtime worker.
