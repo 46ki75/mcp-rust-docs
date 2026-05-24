@@ -12,3 +12,24 @@ pub struct SearchCratesRepositoryInput {
     /// 1-indexed page number.
     pub page: u32,
 }
+
+/// Arguments for the per-crate metadata fetch. The use case has
+/// already trimmed the crate name before constructing this — the
+/// repository assembles the URL verbatim.
+#[derive(Debug, Clone)]
+pub struct FetchCrateInput {
+    /// Crate name as it appears on crates.io (`tokio`, `tokio-util`).
+    pub crate_name: String,
+}
+
+/// Arguments for the dependencies-of-a-version fetch. Both fields are
+/// already resolved — `version` is concrete (not `latest`), and the
+/// crate name is trimmed.
+#[derive(Debug, Clone)]
+pub struct FetchCrateVersionDependenciesInput {
+    /// Crate name.
+    pub crate_name: String,
+    /// Concrete semver version string. The repository does not accept
+    /// `latest` here — version resolution is the use case's job.
+    pub version: String,
+}

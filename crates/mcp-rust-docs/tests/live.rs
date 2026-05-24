@@ -98,6 +98,290 @@ async fn live_search_returns_serde_from_crates_io() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_get_crate_docs_returns_markdown_for_serde_root() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "serde" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    // docs.rs always redirects `/latest/` to a concrete version — the
+    // use case should have parsed it out of the final URL.
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    let md = parsed["markdown"].as_str().expect("markdown string");
+    // After <main> extraction, the markdown should be the crate-root
+    // prose only — that always names the crate. If this stops being
+    // true, the extraction heuristic has broken.
+    assert!(
+        md.to_lowercase().contains("serde"),
+        "live markdown missing crate name: {}",
+        &md.chars().take(500).collect::<String>(),
+    );
+    // Sidebar markers ("All Items", "Crate Items", search box widgets)
+    // should be gone after extraction. Catching their reappearance
+    // would tell us the upstream HTML shape drifted and we're shipping
+    // full-page markdown again.
+    assert!(
+        !md.contains("Crate Items") && !md.contains("In crate "),
+        "sidebar chrome leaked into extracted markdown: {}",
+        &md.chars().take(500).collect::<String>(),
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_search_crate_symbols_finds_serde_deserialize_trait() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_symbols").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "Deserialize",
+                "kinds": ["trait"],
+                "limit": 10,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}"
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    // The Deserialize trait MUST appear when searching serde for
+    // "Deserialize" + kind=trait. If this regresses, the parser is
+    // missing a section or the URL convention has drifted.
+    let items = parsed["items"].as_array().expect("items array");
+    assert!(
+        items.iter().any(|i| i["name"] == "Deserialize"),
+        "Deserialize trait missing from serde symbol search: {parsed}",
+    );
+    // The returned path should be the one get_crate_docs accepts.
+    let trait_item = items
+        .iter()
+        .find(|i| i["name"] == "Deserialize")
+        .expect("Deserialize entry");
+    let path = trait_item["path"].as_str().expect("path string");
+    assert!(
+        path.starts_with("trait.Deserialize.html"),
+        "unexpected path for Deserialize trait: {path}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_search_crate_docs_finds_anyhow_error_mentions() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "anyhow",
+                "query": "error",
+                "limit": 5,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "anyhow");
+    // docs.rs's `/crate/{name}/latest/json.zst` redirects to a
+    // concrete version — the use case should have parsed it out.
+    assert!(
+        parsed["resolved_version"].as_str().is_some(),
+        "expected resolved_version in response: {parsed}",
+    );
+    let total = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "expected at least one hit for `error` in anyhow: {parsed}"
+    );
+    let items = parsed["items"].as_array().expect("items array");
+    assert!(!items.is_empty(), "no items returned: {parsed}");
+    // Every hit must have a non-empty snippet that contains the query.
+    for item in items {
+        let snippet = item["snippet"].as_str().expect("snippet string");
+        assert!(
+            snippet.to_lowercase().contains("error"),
+            "live snippet missing query: {snippet}",
+        );
+    }
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Live counterpart to the hermetic
+/// `search_crate_docs_falls_back_to_older_format_version` test. Hits
+/// real docs.rs against serde — which (as of 2026-05) only has a
+/// format-56 build, so success here proves the fallback chain
+/// dispatches via `rustdoc-types-56` against real upstream bytes, not
+/// just wiremock. May start hitting the format-57 path if/when docs.rs
+/// rebuilds serde; the assertion only checks that *some* dispatch path
+/// succeeds, so a rebuild won't flake it.
+#[tokio::test]
+#[ignore = "live: hits real docs.rs"]
+async fn live_search_crate_docs_falls_back_through_serde() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crate_docs").with_arguments(args(json!({
+                "crate_name": "serde",
+                "query": "deserialize",
+                "limit": 3,
+            }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live serde lookup failed (fallback chain didn't reach a supported format): {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(parsed["crate_name"], "serde");
+    let total = parsed["total_matched"].as_u64().expect("total_matched int");
+    assert!(
+        total > 0,
+        "expected at least one hit for `deserialize` in serde: {parsed}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+/// Live counterpart to `get_crate_docs_attaches_metadata_on_root_call`.
+/// Confirms the parallel docs+metadata composition works against real
+/// docs.rs and real crates.io for a well-known crate. Looks for shape,
+/// not exact contents — `serde` has stable enough surface that the
+/// `derive` feature and a `serde_derive` runtime dep are safe bets.
+#[tokio::test]
+#[ignore = "live: hits real docs.rs and crates.io"]
+async fn live_get_crate_docs_attaches_real_metadata_for_serde() -> anyhow::Result<()> {
+    let server = Server::new()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("get_crate_docs")
+                .with_arguments(args(json!({ "crate_name": "serde" }))),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "live tool returned error: {result:?}",
+    );
+
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+
+    let metadata = parsed["metadata"]
+        .as_object()
+        .unwrap_or_else(|| panic!("metadata missing from live response: {parsed}"));
+    assert_eq!(metadata["crate_name"], "serde");
+
+    // Versions list must be non-empty and capped at the documented
+    // limit (or below if serde happens to have fewer total versions).
+    let versions = metadata["versions"].as_array().expect("versions array");
+    assert!(!versions.is_empty(), "expected at least one version");
+    assert!(versions.len() <= 20, "versions list exceeded cap of 20");
+
+    // `derive` is one of serde's signature features — if it's missing
+    // the Cargo.toml `[features]` extraction has broken.
+    let features = metadata["features"].as_object().expect("features object");
+    assert!(
+        features.contains_key("derive"),
+        "expected `derive` feature on serde: {features:?}",
+    );
+
+    // serde at 1.x has at least one runtime dep (`serde_derive`).
+    let deps = metadata["dependencies"].as_object().expect("dependencies");
+    let runtime_count = deps["runtime_count"].as_u64().expect("runtime_count int");
+    assert!(
+        runtime_count >= 1,
+        "expected at least one runtime dep on serde, got: {runtime_count}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "live: hits real crates.io API"]
 async fn live_search_clamps_per_page_against_real_api() -> anyhow::Result<()> {
     let server = Server::new()?;

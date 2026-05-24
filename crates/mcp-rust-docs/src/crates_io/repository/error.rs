@@ -12,12 +12,27 @@ pub enum CratesIoRepositoryError {
     #[error("HTTP request to crates.io failed: {0}")]
     Network(#[from] reqwest::Error),
 
-    /// The registry returned a non-2xx response. Body is captured
-    /// verbatim — may be JSON or plain text.
-    #[error("crates.io returned HTTP {status}: {body}")]
+    /// The registry returned 404. Broken out from `UpstreamStatus`
+    /// because the use case maps it to a caller-facing "crate or
+    /// version doesn't exist" rather than a generic upstream failure.
+    /// Only meaningful for endpoints that target a single crate (the
+    /// search endpoint never 404s; it returns an empty result set).
+    #[error("crates.io returned 404 for {url}")]
+    NotFound {
+        /// URL that returned 404.
+        url: String,
+    },
+
+    /// The registry returned a non-2xx, non-404 response. Body is
+    /// captured verbatim — may be JSON or plain text.
+    #[error("crates.io returned HTTP {status} for {url}: {body}")]
     UpstreamStatus {
         /// HTTP status code returned by the registry.
         status: reqwest::StatusCode,
+        /// URL that triggered the failure. Mirrors the same field on
+        /// `DocsRsRepositoryError::UpstreamStatus` so operators get
+        /// matching diagnostics from both upstreams.
+        url: String,
         /// Raw response body, kept for diagnostics.
         body: String,
     },
@@ -26,4 +41,16 @@ pub enum CratesIoRepositoryError {
     /// schema — usually means the registry changed its response shape.
     #[error("failed to decode crates.io response: {0}")]
     InvalidResponse(serde_json::Error),
+
+    /// The registry's response body exceeded the configured size cap
+    /// before EOF. Prevents a misbehaving mirror from exhausting
+    /// memory with an unbounded `Content-Length` (or unbounded
+    /// chunked-transfer) response.
+    #[error("crates.io response body for {url} exceeds {limit_bytes}-byte cap")]
+    PayloadTooLarge {
+        /// URL whose body exceeded the cap.
+        url: String,
+        /// The cap that fired, in bytes.
+        limit_bytes: usize,
+    },
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use mcp_rust_docs::Server;
 use rmcp::{ClientHandler, ServiceExt, model::CallToolRequestParams};
 use serde_json::json;
@@ -83,7 +85,7 @@ async fn search_crates_returns_parsed_results() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -131,7 +133,7 @@ async fn search_crates_reports_upstream_http_errors() -> anyhow::Result<()> {
         .mount(&mock)
         .await;
 
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let result = client
@@ -157,9 +159,67 @@ async fn search_crates_reports_upstream_http_errors() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn search_crates_aborts_when_upstream_exceeds_http_timeout() -> anyhow::Result<()> {
+    // Without a default `reqwest` timeout, a stuck upstream socket
+    // hangs the streamable-HTTP transport indefinitely (no per-call
+    // deadline at the protocol layer either). Pin the contract: a
+    // tight builder-supplied timeout MUST fire and surface as a tool
+    // error rather than blocking the handler.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/crates"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(fixture_body())
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&mock)
+        .await;
+
+    let server = Server::builder()
+        .crates_io_base_url(mock.uri())
+        .http_timeout(Duration::from_millis(100))
+        .build()?;
+    let (client, server_handle) = spawn(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("search_crates")
+                .with_arguments(args(json!({ "query": "tokio" }))),
+        )
+        .await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "tool should error rather than hang: {result:?}",
+    );
+
+    client.cancel().await?;
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[test]
+fn default_http_timeout_is_set_and_reasonable() {
+    // Pins that the default-builder branch installs a non-zero, not
+    // absurdly large timeout. The integration test above only proves
+    // an explicit override works; this guards against a refactor that
+    // silently drops the default.
+    let timeout = mcp_rust_docs::router::DEFAULT_HTTP_TIMEOUT;
+    assert!(timeout > Duration::from_secs(0));
+    assert!(timeout < Duration::from_secs(120));
+
+    let connect = mcp_rust_docs::router::DEFAULT_HTTP_CONNECT_TIMEOUT;
+    assert!(connect > Duration::from_secs(0));
+    assert!(connect <= timeout);
+}
+
+#[tokio::test]
 async fn list_tools_advertises_search_crates() -> anyhow::Result<()> {
     let mock = MockServer::start().await;
-    let server = Server::builder().base_url(mock.uri()).build()?;
+    let server = Server::builder().crates_io_base_url(mock.uri()).build()?;
     let (client, server_handle) = spawn(server).await;
 
     let tools = client.list_all_tools().await?;

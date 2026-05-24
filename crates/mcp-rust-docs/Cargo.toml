@@ -1,12 +1,12 @@
 [package]
 name = "mcp-rust-docs"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "MCP server exposing Rust ecosystem tools (starting with crates.io search)."
+description = "MCP server exposing Rust ecosystem tools: crates.io search and docs.rs documentation retrieval."
 
 [lints]
 workspace = true
@@ -19,13 +19,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
+fast_html2md = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = { workspace = true }
+ruzstd = { workspace = true }
+rustdoc-types = { workspace = true }
+rustdoc-types-56 = { workspace = true }
+moka = { workspace = true }
 
 [dev-dependencies]
 rmcp = { workspace = true, features = [

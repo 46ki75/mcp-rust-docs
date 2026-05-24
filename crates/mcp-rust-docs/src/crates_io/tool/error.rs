@@ -26,6 +26,9 @@ impl CratesIoToolError {
             Self::UseCase(CratesIoUseCaseError::InvalidQuery(reason)) => {
                 format!("Invalid request: {reason}")
             }
+            Self::UseCase(CratesIoUseCaseError::InconsistentUpstream(reason)) => {
+                format!("Upstream failure: {reason}")
+            }
             Self::UseCase(CratesIoUseCaseError::Repository(err)) => {
                 format!("Upstream failure: {err}")
             }
