@@ -309,7 +309,20 @@ contract verification → `tests/live.rs` with `#[ignore]`.
   crates.io trusted publishing via OIDC (no long-lived token).
   Auto-creates a GitHub release with `--prerelease` flag detected from
   the semver pre-release suffix (anything after `-`, e.g.
-  `1.0.0-alpha.0`). Publishes with `--locked`.
+  `1.0.0-alpha.0`). Publishes with `--locked`. A second
+  `upload-binaries` job (`needs: publish`) then builds the
+  `mcp-rust-docs` binary for six targets (ARM64 + AMD64 ×
+  Linux/macOS/Windows) on native GitHub-hosted runners and attaches
+  the `.tar.gz`/`.zip` archives plus `.sha256` sidecars to that
+  release. Native runners only — no cross-compile — because the crate
+  is pure Rust (rustls + ring, no OpenSSL). The ARM64 runners are free
+  for public repos only. A third `sign-checksums` job
+  (`needs: upload-binaries`) then hashes every archive into one
+  `SHA256SUMS`, GPG-signs it (detached `SHA256SUMS.asc`), and uploads
+  both. Per-file `.sha256` sidecars are intentionally omitted — the
+  signed manifest is the single source of truth. Signing needs two
+  repo secrets, `GPG_PRIVATE_KEY` (armored signing subkey) and
+  `GPG_PASSPHRASE`; absent them the job fails but binaries still ship.
 - `.github/dependabot.yml` — weekly cargo + github-actions updates,
   with minor+patch bundled into a single PR per ecosystem.
 

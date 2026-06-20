@@ -105,3 +105,129 @@ jobs:
               --generate-notes \
               --latest
           fi
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform release binaries (ARM64 + AMD64 × Linux/macOS/Windows).
+  #
+  # `needs: publish` so the GitHub release these assets attach to already
+  # exists, and the `if` gates to a real tag push — never the
+  # workflow_dispatch dry-run path, which creates no release.
+  #
+  # Every target builds on a NATIVE GitHub-hosted runner: no cross-compile,
+  # no Docker, no per-target C toolchain. The crate is pure Rust — reqwest
+  # is pinned to rustls + ring (see Cargo.lock), so there's no OpenSSL to
+  # build per architecture.
+  #
+  # `fail-fast: false`: crates.io has already published by this point, so a
+  # single flaky platform should still let the other five binaries ship.
+  #
+  # NOTE: the ARM64 runners (`ubuntu-24.04-arm`, `windows-11-arm`) are free
+  # for PUBLIC repos. If this repo ever goes private they bill at standard
+  # per-minute rates — revisit the matrix then.
+  upload-binaries:
+    name: upload ${{ matrix.target }}
+    needs: publish
+    if: ${{ github.event_name == 'push' && inputs.dry-run != true }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pins the toolchain to rust-toolchain.toml (1.90) and installs the
+      # cross/native target rustup component.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # Builds the `mcp-rust-docs` binary for the target, packages it
+      # (`.tar.gz` on unix, `.zip` on windows), and uploads the archive to
+      # the release for this tag. Archive names land as e.g.
+      # `mcp-rust-docs-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`. Per-file
+      # checksums are intentionally omitted — the `sign-checksums` job below
+      # publishes a single signed `SHA256SUMS` covering every archive.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: mcp-rust-docs
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Aggregate every uploaded archive into one SHA256SUMS manifest and sign it
+  # with GPG. A single detached signature (`SHA256SUMS.asc`) covers all
+  # artifacts — the reason aggregation and signing go together.
+  #
+  # Requires two repo secrets (one-time setup; see the README/release notes):
+  #   GPG_PRIVATE_KEY  ASCII-armored secret (sub)key, e.g.
+  #                    `gpg --armor --export-secret-subkeys <KEYID>`
+  #   GPG_PASSPHRASE   that key's passphrase
+  #
+  # Heads-up: unlike the OIDC crates.io publish above, a stored private key is
+  # a long-lived secret. Prefer exporting a dedicated, revocable SIGNING
+  # SUBKEY (not your primary key), ideally with an expiry. If the secrets are
+  # absent this job fails loudly while the binaries above still ship unsigned.
+  #
+  # Consumers verify with:
+  #   gpg --verify SHA256SUMS.asc SHA256SUMS
+  #   sha256sum -c SHA256SUMS --ignore-missing
+  sign-checksums:
+    name: checksums + GPG signature
+    needs: upload-binaries
+    if: ${{ github.event_name == 'push' && inputs.dry-run != true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Pull the archives back off the release to hash them. `fail-fast: false`
+      # upstream means this manifest covers whichever targets succeeded.
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.tar.gz' --pattern '*.zip' \
+            --dir dist
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum -- * ) > SHA256SUMS
+          cat SHA256SUMS
+
+      # Imports the key and preloads gpg-agent with the passphrase so the
+      # batch sign below runs non-interactively.
+      - name: Import GPG signing key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign SHA256SUMS
+        run: |
+          set -euo pipefail
+          gpg --batch --yes --armor \
+            --output SHA256SUMS.asc \
+            --detach-sign SHA256SUMS
+
+      - name: Upload checksums + signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            SHA256SUMS SHA256SUMS.asc --clobber
