@@ -1149,7 +1149,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rustdoc-types 0.56.0",
- "rustdoc-types 0.57.3",
+ "rustdoc-types 0.59.0",
  "ruzstd",
  "schemars",
  "serde",
@@ -1822,9 +1822,9 @@ dependencies = [
 
 [[package]]
 name = "rustdoc-types"
-version = "0.57.3"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e6919c49bdd9cca072b3b502d16c073d0a4d3b7283ff6e0c86a5f6e6b07bbfe"
+checksum = "b3e25ff539c83e47de65a6a790446186286d3a64bfadc780ed557cc3410d9509"
 dependencies = [
  "serde",
  "serde_derive",
