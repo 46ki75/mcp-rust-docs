@@ -36,6 +36,18 @@ Both accept `--crates-io-base-url` (env `MCP_CRATES_IO_BASE_URL`) and
 fixtures or registry mirrors. The HTTP subcommand accepts `--bind` (env
 `MCP_BIND_ADDRESS`, default `127.0.0.1:8000`).
 
+A second, unpublished workspace member — `crates/mcp-rust-docs-vercel`
+— is the Vercel deployment entry point (`api/mcp.rs` as a `[[bin]]`,
+per the Vercel Rust runtime's function-discovery convention). It wraps
+the same `Server` in a **stateless** `StreamableHttpService`
+(`NeverSessionManager`, `stateful_mode(false)`, `json_response(true)`)
+because serverless instances can't share `LocalSessionManager`'s
+in-memory sessions, and builds the rmcp `Host` allowlist from Vercel's
+system env vars plus `MCP_ALLOWED_HOSTS` (rmcp defaults to
+loopback-only, which would reject the deployment URL). See that
+crate's README for Vercel project settings. Config knobs stay
+env-only (no clap) to keep the binary thin.
+
 ## Commands
 
 All workflows run through `just` — `cargo` is never invoked directly

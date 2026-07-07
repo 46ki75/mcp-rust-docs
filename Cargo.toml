@@ -51,6 +51,9 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 rustdoc-types = "0.57"
 rustdoc-types-56 = { package = "rustdoc-types", version = "=0.56.0" }
 moka = { version = "0.12", features = ["future"] }
+# Vercel deployment entry point (crates/mcp-rust-docs-vercel) only.
+vercel_runtime = { version = "2.4", features = ["axum"] }
+tower = "0.5"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
