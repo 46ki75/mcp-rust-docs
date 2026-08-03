@@ -62,7 +62,7 @@ async fn main() -> Result<(), vercel_runtime::Error> {
         move || Ok(server_template.clone()),
         NeverSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true)
             .with_allowed_hosts(allowed_hosts),
     );
