@@ -48,7 +48,7 @@ ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 # add a `rustdoc-types-NN` rename for the previous version, add the
 # matching From impl and dispatch arm in `docs_rs/schema.rs`, and add
 # a format-NN fixture under `tests/fixtures/`.
-rustdoc-types = "0.57"
+rustdoc-types = "0.61"
 rustdoc-types-56 = { package = "rustdoc-types", version = "=0.56.0" }
 moka = { version = "0.12", features = ["future"] }
 # Vercel deployment entry point (crates/mcp-rust-docs-vercel) only.
