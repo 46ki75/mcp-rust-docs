@@ -15,7 +15,7 @@ pub use self::response::{
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router,
 };
 
@@ -73,7 +73,7 @@ impl Server {
         };
 
         match serde_json::to_string_pretty(&response) {
-            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+            Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
             Err(err) => Err(McpError::internal_error(
                 format!("failed to serialize tool output: {err}"),
                 None,
@@ -106,7 +106,7 @@ impl Server {
         let response = SearchCrateSymbolsResponse::from(output);
 
         match serde_json::to_string_pretty(&response) {
-            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+            Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
             Err(err) => Err(McpError::internal_error(
                 format!("failed to serialize tool output: {err}"),
                 None,
@@ -135,7 +135,7 @@ impl Server {
         let response = SearchCrateDocsResponse::from(output);
 
         match serde_json::to_string_pretty(&response) {
-            Ok(text) => Ok(CallToolResult::success(vec![Content::text(text)])),
+            Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
             Err(err) => Err(McpError::internal_error(
                 format!("failed to serialize tool output: {err}"),
                 None,

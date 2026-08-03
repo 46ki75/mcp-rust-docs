@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::crates_io::use_case::CratesIoUseCaseError;
 
@@ -33,6 +33,6 @@ impl CratesIoToolError {
                 format!("Upstream failure: {err}")
             }
         };
-        CallToolResult::error(vec![Content::text(message)])
+        CallToolResult::error(vec![ContentBlock::text(message)])
     }
 }

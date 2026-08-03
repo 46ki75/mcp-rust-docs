@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::docs_rs::repository::DocsRsRepositoryError;
 use crate::docs_rs::use_case::DocsRsUseCaseError;
@@ -47,6 +47,6 @@ impl DocsRsToolError {
                 format!("Upstream failure: {reason}")
             }
         };
-        CallToolResult::error(vec![Content::text(message)])
+        CallToolResult::error(vec![ContentBlock::text(message)])
     }
 }
