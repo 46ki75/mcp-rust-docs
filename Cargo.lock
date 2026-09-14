@@ -546,7 +546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -572,9 +572,9 @@ dependencies = [
 
 [[package]]
 name = "fast_html2md"
-version = "0.0.62"
+version = "0.0.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88587bc3328375d9866f0f71ffcfe5768fe0df79dde79c79216239711868f77f"
+checksum = "22fb851eabfefa3a87a42cc06888796411386736e3c888973497be2f95c4af6a"
 dependencies = [
  "auto_encoder",
  "futures-util",
